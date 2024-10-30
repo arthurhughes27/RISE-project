@@ -1,5 +1,5 @@
 # RISE-project
-Repository accompanying the paper "Rank-Based Identification of High-dimensionalSurrogate Markers :  Application to Vaccinology" 
+Repository accompanying the paper "Rank-Based Identification of High-dimensional Surrogate Markers :  Application to Vaccinology" 
 
 All data from the data application has been removed for data protection purposes. 
 
