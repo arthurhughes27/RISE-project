@@ -36,61 +36,104 @@ n_sim <- 500 # number of simulations
 corr = 0 # correlation - off-diagonal element in surrogate covariance matrix
 
 # Data generation function
-gen.data <- function(n1, n0, p, prop_valid, valid_sigma, corr) {
-  
-  # calculate the number of valid and invalid surrogates
-  p_valid = prop_valid * p 
-  p_invalid = (1 - prop_valid) * p
-  
-  # generate primary responses from multivariate normal distributions
-  y1 <- rnorm(n1, y1_mean, y1_sd) # treated response 
-  y0 <- rnorm(n0, y0_mean, y0_sd) # untreated repsonse
-  
-  # generate candidate surrogates 
-  mm <- runif(p_invalid, min = 0.5, max = 2.5) # generate random invalid surrogate means from uniform distribution
-  ss <- runif(p_invalid, min = 0.5, max = 2)  # generate random invalid surrogate sds from uniform distribution
-  Sigma_invalid = matrix(corr, nrow = p_invalid, ncol= p_invalid) # Invalid surrogate covariance matrix
-  diag(Sigma_invalid) = ss 
-
-  if (prop_valid != 0){ # if more than one valid surrogate wanted
+# Data generation function
+gen.data <- function(n1, n0, p, prop_valid, valid_sigma, corr, mode = "simple") {
+  if (mode == "simple"){
     
-    # valid surrogate covariance matrix
-    Sigma_valid = matrix(corr*valid_sigma, nrow = p_valid, ncol= p_valid) 
-    diag(Sigma_valid) = rep(valid_sigma, p_valid)
+    # calculate the number of valid and invalid surrogates
+    p_valid = prop_valid * p 
+    p_invalid = (1 - prop_valid) * p
     
-    # valid surrogates in treated group by perturbing primary response
-    s1.valid <- matrix(y1, nrow = n1, ncol = p_valid, byrow = TRUE) + 
-      mvrnorm(n = n1, mu = rep(0, p_valid), Sigma = Sigma_valid)
+    # generate primary responses from multivariate normal distributions
+    y1 <- rnorm(n1, y1_mean, y1_sd) # treated response 
+    y0 <- rnorm(n0, y0_mean, y0_sd) # untreated repsonse
     
-    # valid surrogates in untreated group by perturbing primary response
-    s0.valid <- matrix(y0, nrow = n0, ncol = p_valid, byrow = TRUE) + 
-      mvrnorm(n = n0, mu = rep(0, p_valid), Sigma = Sigma_valid)
+    # generate candidate surrogates 
+    mm <- runif(p_invalid, min = 0.5, max = 2.5) # generate random invalid surrogate means from uniform distribution
+    ss <- runif(p_invalid, min = 0.5, max = 2)  # generate random invalid surrogate sds from uniform distribution
+    Sigma_invalid = matrix(corr, nrow = p_invalid, ncol= p_invalid) # Invalid surrogate covariance matrix
+    diag(Sigma_invalid) = ss 
     
-    # invalid surrogates
-    s1.invalid <- mvrnorm(n = n1, mu = mm, Sigma = Sigma_invalid)
-    s0.invalid <- mvrnorm(n = n0, mu = mm, Sigma = Sigma_invalid)
+    if (prop_valid != 0){ # if valid surrogates required
+      
+      # valid surrogate covariance matrix
+      Sigma_valid = matrix(corr*valid_sigma, nrow = p_valid, ncol= p_valid) 
+      diag(Sigma_valid) = rep(valid_sigma, p_valid)
+      
+      # valid surrogates in treated group by perturbing primary response
+      s1.valid <- matrix(y1, nrow = n1, ncol = p_valid, byrow = TRUE) + 
+        mvrnorm(n = n1, mu = rep(0, p_valid), Sigma = Sigma_valid)
+      
+      # valid surrogates in untreated group by perturbing primary response
+      s0.valid <- matrix(y0, nrow = n0, ncol = p_valid, byrow = TRUE) + 
+        mvrnorm(n = n0, mu = rep(0, p_valid), Sigma = Sigma_valid)
+      
+      # invalid surrogates
+      if (prop_valid != 1){ # if invalid surrogates required
+        s1.invalid <- mvrnorm(n = n1, mu = mm, Sigma = Sigma_invalid)
+        s0.invalid <- mvrnorm(n = n0, mu = mm, Sigma = Sigma_invalid)
+        # bind candidates together 
+        s1 <- cbind(s1.valid, s1.invalid)
+        s0 <- cbind(s0.valid, s0.invalid)
+      } else {
+        s1 = s1.valid 
+        s0 = s0.valid 
+      }
+      
+    } else { # if no valid surrogates required 
+      # invalid surrogates
+      s1 <- mvrnorm(n = n1, mu = mm, Sigma = Sigma_invalid)
+      s0 <- mvrnorm(n = n0, mu = mm, Sigma = Sigma_invalid)
+    }
+    # store hypothesis truths
+    hyp <- c(rep("null false", p_valid), rep("null true", p_invalid))
     
-    # bind candidates together 
-    s1 <- cbind(s1.valid, s1.invalid)
-    s0 <- cbind(s0.valid, s0.invalid)
-  } else { # if no valid surrogates required 
+    # return generated data as a list
+    return(list(y1 = y1, y0 = y0, s1 = s1, s0 = s0, hyp = hyp))
+  } else if (mode == "complex") {
+    # calculate the number of valid and invalid surrogates
+    p_valid = prop_valid * p 
+    p_invalid = (1 - prop_valid) * p
     
-    # invalid surrogates
-    s1 <- mvrnorm(n = n1, mu = mm, Sigma = Sigma_invalid)
-    s0 <- mvrnorm(n = n0, mu = mm, Sigma = Sigma_invalid)
+    # generate primary responses from multivariate normal distributions
+    y1 <- rnorm(n1, y1_mean, y1_sd) # treated response 
+    y0 <- rnorm(n0, y0_mean, y0_sd) # untreated repsonse
+    
+    # generate candidate surrogates 
+    lambda = runif(p_invalid, min = 0.5, max = 2.5)
+    if (prop_valid != 0){ #if valid surrogates required
+      # valid surrogate covariance matrix
+      Sigma_valid = matrix(corr*valid_sigma, nrow = p_valid, ncol= p_valid) 
+      diag(Sigma_valid) = rep(valid_sigma, p_valid)
+      s1.valid = matrix(y1^3, nrow = n1, ncol = p_valid, byrow = TRUE) + 
+        mvrnorm(n = n1, mu = rep(0, p_valid), Sigma = Sigma_valid)
+      
+      s0.valid = matrix(y0^3, nrow = n0, ncol = p_valid, byrow = TRUE) + 
+        mvrnorm(n = n0, mu = rep(0, p_valid), Sigma = Sigma_valid)
+      
+      if (prop_valid != 1){ #if invalid surrogates required
+        s0.invalid = sapply(lambda, function(rate) rexp(n0, rate))
+        s1.invalid = sapply(lambda, function(rate) rexp(n1, rate))
+        s1 <- cbind(s1.valid, s1.invalid)
+        s0 <- cbind(s0.valid, s0.invalid)
+      } else {
+        s1 = s1.valid 
+        s0 = s0.valid  
+      }
+    } else {
+      s0 = sapply(lambda, function(rate) rexp(n0, rate))
+      s1 = sapply(lambda, function(rate) rexp(n1, rate))
+    }
+    hyp <- c(rep("null false", p_valid), rep("null true", p_invalid))
+    return(list(y1 = y1, y0 = y0, s1 = s1, s0 = s0, hyp = hyp))
   }
-  # store hypothesis truths
-  hyp <- c(rep("null false", p_valid), rep("null true", p_invalid))
-  
-  # return generated data as a list
-  return(list(y1 = y1, y0 = y0, s1 = s1, s0 = s0, hyp = hyp))
 }
 
 
 # Function to estimate the ground truth using asymptotic properties 
-calc.truth <- function(p, prop_valid, valid_sigma, corr) {
+calc.truth <- function(p, prop_valid, valid_sigma, corr, mode = "simple") {
   # generate a dataset with a large sample size 
-  dd <- gen.data(n1 = 10000, n0 = 10000, p, prop_valid, valid_sigma, corr = corr)
+  dd <- gen.data(n1 = 10000, n0 = 10000, p, prop_valid, valid_sigma, corr = corr, mode = mode)
   
   # find the asymptotic U statistic for Y
   uy <- (10000 * 10000)^(-1) * wilcox.test(dd$y1, dd$y0)$statistic
@@ -110,10 +153,10 @@ calc.truth <- function(p, prop_valid, valid_sigma, corr) {
               delta_true_sd = delta_sd))
 }
 
-# truth <- calc.truth(p, prop_valid, valid_sigma, corr)
+# truth <- calc.truth(p, prop_valid, valid_sigma, corr, mode = "simple")
 
 # Function to simulate results (performance metrics)
-simulate_results <- function(n1, n0, p, prop_valid, n_sim, valid_sigma, corr) {
+simulate_results <- function(n1, n0, p, prop_valid, n_sim, valid_sigma, corr, mode = "simple") {
   p_unadjusted <- matrix(0, nrow = n_sim, ncol = p) # store unadjusted p_values for each candidate and for each simulation
   fpr_unadjusted <- numeric(n_sim) # store unadjusted false positive rates per simulation
   fdr_unadjusted <- numeric(n_sim) # store unadjusted proportion of false positives per simulation
@@ -140,7 +183,7 @@ simulate_results <- function(n1, n0, p, prop_valid, n_sim, valid_sigma, corr) {
   
   for (k in 1:n_sim) { # for loop to do many simulations
     # generate data
-    data <- gen.data(n1, n0, p, prop_valid, valid_sigma, corr)
+    data <- gen.data(n1, n0, p, prop_valid, valid_sigma, corr, mode = mode)
     
     # Estimate u_y
     u_y_estimated <- test.surrogate(
@@ -336,7 +379,8 @@ for (i in 1:length(n_grid)){
                             prop_valid = 0, 
                             n_sim = 1, 
                             valid_sigma,
-                            corr = 0)
+                            corr = 0, 
+                            mode = "simple")
     
     # p_values = append(p_values,list(res[["p_values"]][["p_unadjusted"]]))
     
@@ -411,7 +455,8 @@ for (i in 1:length(corr_grid)){
                               prop_valid = 0, 
                               n_sim = 1, 
                               valid_sigma,
-                              corr = corr_grid[i])
+                              corr = corr_grid[i], 
+                              mode = "simple")
       
       # p_values = append(p_values,list(res[["p_values"]][["p_unadjusted"]]))
       
@@ -461,16 +506,16 @@ ggsave(plot = fig2,
 ## We want average surrogate strengths from U_S = 0.55 to U_Y (to 2 d.p.)
 ## We do this by trial and error
 
-# round(mean(calc.truth(p, prop_valid, valid_sigma = 244, corr)$us_true),2)
-# round(mean(calc.truth(p, prop_valid, valid_sigma = 68, corr)$us_true),2)
-# round(mean(calc.truth(p, prop_valid, valid_sigma = 30, corr)$us_true),2)
-# round(mean(calc.truth(p, prop_valid, valid_sigma = 15, corr)$us_true),2)
-# round(mean(calc.truth(p, prop_valid, valid_sigma = 9, corr)$us_true),2)
-# round(mean(calc.truth(p, prop_valid, valid_sigma = 5.5, corr)$us_true),2)
-# round(mean(calc.truth(p, prop_valid, valid_sigma = 3, corr)$us_true),2)
-# round(mean(calc.truth(p, prop_valid, valid_sigma = 1.8, corr)$us_true),2)
-# round(mean(calc.truth(p, prop_valid, valid_sigma = 0.65, corr)$us_true),2)
-# round(mean(calc.truth(p, prop_valid, valid_sigma = 0.01, corr)$us_true),2)
+# round(mean(calc.truth(p, prop_valid, valid_sigma = 244, corr, mode = "simple")$us_true),2)
+# round(mean(calc.truth(p, prop_valid, valid_sigma = 68, corr, mode = "simple")$us_true),2)
+# round(mean(calc.truth(p, prop_valid, valid_sigma = 30, corr, mode = "simple")$us_true),2)
+# round(mean(calc.truth(p, prop_valid, valid_sigma = 15, corr, mode = "simple")$us_true),2)
+# round(mean(calc.truth(p, prop_valid, valid_sigma = 9, corr, mode = "simple")$us_true),2)
+# round(mean(calc.truth(p, prop_valid, valid_sigma = 5.5, corr, mode = "simple")$us_true),2)
+# round(mean(calc.truth(p, prop_valid, valid_sigma = 3, corr, mode = "simple")$us_true),2)
+# round(mean(calc.truth(p, prop_valid, valid_sigma = 1.8, corr, mode = "simple")$us_true),2)
+# round(mean(calc.truth(p, prop_valid, valid_sigma = 0.65, corr, mode = "simple")$us_true),2)
+# round(mean(calc.truth(p, prop_valid, valid_sigma = 0.01, corr, mode = "simple")$us_true),2)
 
 # Set up the values to simulate
 sigma_grid = c(0.01,0.65,1.8,3,5.5,9,15,30,68,244) # values of sigma
@@ -505,7 +550,7 @@ metrics_fig3 <- data.frame(
 
 # Perform simulations over grid
 for (sigma in sigma_grid){
-  avg_us = round(mean(calc.truth(p_grid[1], prop_valid, valid_sigma = sigma, corr)$us_true),2)
+  avg_us = round(mean(calc.truth(p_grid[1], prop_valid, valid_sigma = sigma, corr, mode = "simple")$us_true),2)
   for (n in n_grid) {
     for (p in p_grid) {
       res <- simulate_results(n1 = n / 2, 
@@ -514,7 +559,8 @@ for (sigma in sigma_grid){
                               prop_valid, 
                               n_sim = n_sim, 
                               valid_sigma = sigma,
-                              corr = 0)
+                              corr = 0, 
+                              mode = "simple")
       
       # p_values = append(p_values,list(res[["p_values"]][["p_unadjusted"]]))
       
@@ -603,4 +649,93 @@ ggsave(plot = figure3,
        width = 35, 
        height = 18)
 
+##--Figure 4--##
+### Evaluation stage
+### Vary the proportion of false positives in the combined marker and examine distribution of p-values. 
 
+# Step 1 : construct a marker as a combination of true and false positives
+# Keep true positives strong on average : U_Y = 0.9
+source("./R/rise_validate.R")
+source("./R/rise_screen.R")
+set.seed(23102024)
+n1 = 25 # treated individuals
+n0 = 25 # untreated
+p = 20 # number of genes to combine for the signature
+valid_sigma = 1.8 # this corresponds to avg U_Y = 0.9
+corr = 0
+prop_invalid_grid = seq(0,1,0.1)
+n_sim = 500
+
+# evaluate true surrogate strength
+truth <- calc.truth(p = 50, prop_valid=1, valid_sigma, corr, mode = "simple")
+mean(truth$us_true)
+
+p_evaluate_df = as.data.frame(matrix(0,nrow = n_sim, ncol = length(prop_invalid_grid)))
+colnames(p_evaluate_df) = prop_invalid_grid
+for (i in 1:length(prop_invalid_grid)){
+  for (j in 1:n_sim){
+    prop_invalid = prop_invalid_grid[i]
+    prop_valid = 1 - prop_invalid 
+    
+    data = gen.data(n1, n0, p, prop_valid, valid_sigma, corr, mode = "simple")
+    
+    # get weights from screening function
+    Y = c(data$y1,data$y0)
+    A = c(rep(1,n1), rep(0,n0))
+    X = rbind(data$s1, data$s0)
+    colnames(X) = c(1:ncol(X))
+    
+    u_y_estimated <- test.surrogate(
+      yone = data$y1, yzero = data$y0, sone = data$y1, szero = data$y0, epsilon = 0.1
+    )$u.y
+    # u_y_true = truth$uy_true
+    # choose epsilon as maximum of estimated value of UY - 0.5 and 0
+    eps <- max(0, u_y_estimated - 0.5)
+    
+    screen_res = rise_screen(Y, X, A, reference = "0", 
+                             alpha = 0.05, epsilon = eps,
+                             p_correction = "none", cores = 1)
+    
+    weights = data.frame("marker" = colnames(X),
+                         "weight" = abs(1/screen_res$results[,"delta"]))
+    res_evaluate = rise_validate(Y_validate = Y, X_validate = X, A_validate = A,
+                                 markers = colnames(X), power_desired = 0.8,
+                                 weights = weights, plot = F, alpha = 0.05)
+    
+    p_evaluate_df[j,i] = res_evaluate$validation_results[,"p_unadjusted"]
+    print(paste0("Prop. invalid = ", prop_invalid_grid[i],  " : Simulation ", j, " of ", n_sim, " complete."))
+  }
+}
+save(p_evaluate_df, file = "./output/simulation_results_final/metrics_figure4s.Rdata")
+# p_evaluate_df = get(load("./output/simulation_results_final/metrics_figure4s.Rdata"))
+
+p_evaluate_long <- p_evaluate_df %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  mutate(variable = as.numeric(variable))  # Convert variable names to numeric
+
+# Create the violin plot
+fig4 = ggplot(p_evaluate_long, aes(x = as.factor(variable), y = value, fill = as.factor(variable))) +
+  geom_boxplot(outlier.shape = NA) +
+  labs(
+    x = "Proportion of invalid surrogates",
+    y = "P-value",
+    title = "Evaluation stage P-values as a function of the proportion of false positives in gamma"
+  ) +
+  geom_hline(yintercept = 0.05, linetype = "dashed", colour = "red") + 
+  theme_minimal(base_size = 18) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.background = element_rect(fill = 'white', color = 'white'),
+        legend.position = "none")
+
+fig4
+
+
+ggsave(plot = fig4, filename = "figures4.pdf",
+       path = "./output/figures/main/",
+       units = "cm",
+       width = 35,
+       height = 18)
