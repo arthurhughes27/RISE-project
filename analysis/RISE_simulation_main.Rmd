@@ -392,6 +392,7 @@ metrics_fig1 = data.frame("n" = metrics_fig1[,1],
                           "FPR" = metrics_fig1[,2])
 
 save(metrics_fig1, file = "./output/simulation/metrics_figure1.Rdata")
+metrics_figure1 = get(load("./output/simulation/metrics_figure1.Rdata"))
 
 fig1 = metrics_fig1 %>% ggplot(aes(x = as.factor(n), 
                                    y = FPR, 
@@ -469,7 +470,7 @@ metrics_fig2 = data.frame("correlation" = metrics_fig2[,1],
 
 save(metrics_fig2, file = "./output/simulation/metrics_figure2.Rdata")
 
-# metrics_fig2 = get(load("./output/simulation/simulation/metrics_figure2.Rdata"))
+metrics_fig2 = get(load("./output/simulation/metrics_figure2.Rdata"))
 
 fig2 = metrics_fig2 %>% ggplot(aes(x = as.factor(correlation), 
                                    y = FPR, 
@@ -718,7 +719,7 @@ for (i in 1:length(prop_invalid_grid)){
   }
 }
 save(p_evaluate_df, file = "./output/simulation/metrics_figure4s.Rdata")
-# p_evaluate_df = get(load("./output/simulation/metrics_figure4s.Rdata"))
+p_evaluate_df = get(load("./output/simulation/metrics_figure4s.Rdata"))
 
 p_evaluate_long <- p_evaluate_df %>%
   pivot_longer(
@@ -734,7 +735,7 @@ fig4 = ggplot(p_evaluate_long, aes(x = as.factor(variable), y = value, fill = as
   labs(
     x = "Proportion of invalid surrogates",
     y = "P-value",
-    title = "Evaluation stage P-values as a function of the proportion of false positives in gamma"
+    title = expression("Evaluation stage P-values as a function of the proportion of false positives in " * gamma[S])
   ) +
   geom_hline(yintercept = 0.05, linetype = "dashed", colour = "red") + 
   theme_minimal(base_size = 18) +
@@ -767,7 +768,6 @@ y0_mean <- 0 # primary response mean value in untreated group
 y0_sd <- 1 # primary response sd value in untreated group
 y1_mean <- 3 # primary response mean value in treated group
 y1_sd <- 1 # primary response sd value in treated group
-valid_sigma <- 10 # level of perturbation for valid surrogates (lower = stronger surrogates)
 n <- 50 # total sample size
 n0 <- n / 2 # treated sample size 
 n1 <- n / 2 # untreated sample size 
@@ -775,7 +775,7 @@ p <- 500 # total number of predictors
 prop_valid <- 0 # proportion of predictors which are valid surrogates
 p_valid <- prop_valid * p # number of valid surrogates
 p_invalid = (1 - prop_valid) * p # number of invalid surrogates
-n_sim = 500 # number of simulations
+n_sim = 1000 # number of simulations
 corr = 0 # correlation - off-diagonal element in surrogate covariance matrix
 
 p_figs1 = matrix(0)
@@ -786,7 +786,6 @@ for (j in 1:n_sim){
                             p = p, 
                             prop_valid = 0, 
                             n_sim = 1, 
-                            valid_sigma,
                             corr = corr, 
                             mode = "simple")
     # Append p-values to results 
@@ -798,11 +797,11 @@ for (j in 1:n_sim){
 metrics_figures1 =  data.frame("p" = p_figs1[-1])
 
 save(p_figs1, file = "./output/simulation/metrics_figures1.Rdata")
-# metrics_figures1 = get(load("./output/simulation/metrics_figures1.Rdata"))
+metrics_figures1 = get(load("./output/simulation/metrics_figures1.Rdata"))
 
 fig_s1 = metrics_figures1 %>% ggplot(aes(x = p)) +
-  geom_histogram(binwidth = 0.03, fill = "lightblue", color = "black", alpha = 0.7) +
-  labs(title = "Distribution of P-values under the null hypothesis", x = "P-value", y = "Frequency") +
+  geom_histogram(binwidth = 0.03, fill = "lightblue", color = "black", alpha = 0.7, aes(y = ..density..)) +
+  labs(title = "Distribution of P-values under the null hypothesis", x = "P-value", y = "Density") +
   xlim(0,1) +
   theme_minimal(base_size = 18) +
   theme(plot.title = element_text(hjust = 0.5),
@@ -909,7 +908,7 @@ for (sigma in sigma_grid){
 
 save(metrics_figs2, file = "./output/simulation/metrics_figures2.Rdata")
 
-# metrics_figs2 = get(load("./output/simulation/metrics_figures2.Rdata"))
+metrics_figs2 = get(load("./output/simulation/metrics_figures2.Rdata"))
 
 # Pivot metrics to long format 
 metrics_figs2_fdr_long <- metrics_figs2  %>%
@@ -1034,6 +1033,9 @@ for (i in 1:length(corr_grid)){
   }
 }
 
+save(metrics_figs3, file = "./output/simulation/metrics_figures3.Rdata")
+metrics_figs3 = get(load("./output/simulation/metrics_figures3.Rdata"))
+
 metrics_figs3 = data.frame("correlation" = metrics_figs3[,1], "fdr" = metrics_figs3[,2], "tpr" = metrics_figs3[,3])
 
 metrics_figs3 %>% ggplot(aes(x = as.factor(correlation), y = fdr))
@@ -1067,8 +1069,6 @@ figures3 = grid.arrange(
   top = textGrob("Empirical Power and Proportion of False Positives as a function of correlation",
                  gp = gpar(fontsize = 20))  # Adjust fontsize and fontface
 )
-
-save(metrics_figs3, file = "./output/simulation/metrics_figures3.Rdata")
 
 ggsave(plot = figures3,
        "./output/figures/figures3.pdf", 
@@ -1201,7 +1201,7 @@ metrics_figs5 = data.frame("correlation" = metrics_figs5[,1],
 
 save(metrics_figs5, file = "./output/simulation/metrics_figures5.Rdata")
 
-# metrics_figs5 = get(load("./output/simulation/simulation/metrics_figures5.Rdata"))
+metrics_figs5 = get(load("./output/simulation/metrics_figures5.Rdata"))
 
 figs5 = metrics_figs5 %>% ggplot(aes(x = as.factor(correlation), 
                                    y = FPR, 
@@ -1223,7 +1223,7 @@ ggsave(plot = figs5,
        "./output/figures/figures5.pdf", 
        units = "cm", 
        width = 40, 
-       height = 25)
+       height = 20)
 ```
 
 ## Figure S6
@@ -1451,7 +1451,7 @@ for (i in 1:length(prop_invalid_grid)){
   }
 }
 save(p_evaluate_df, file = "./output/simulation/metrics_figures7s.Rdata")
-# p_evaluate_df = get(load("./output/simulation/metrics_figures7s.Rdata"))
+p_evaluate_df = get(load("./output/simulation/metrics_figures7s.Rdata"))
 
 p_evaluate_long <- p_evaluate_df %>%
   pivot_longer(
@@ -1467,8 +1467,7 @@ figs7 = ggplot(p_evaluate_long, aes(x = as.factor(variable), y = value, fill = a
   labs(
     x = "Proportion of invalid surrogates",
     y = "P-value",
-    title = "Evaluation stage P-values as a function of the proportion of false positives in gamma - DGF 2"
-  ) +
+    title = expression("Evaluation stage P-values as a function of the proportion of false positives in " * gamma[S] *" - DGF 2")) +
   geom_hline(yintercept = 0.05, linetype = "dashed", colour = "red") + 
   theme_minimal(base_size = 18) +
   theme(plot.title = element_text(hjust = 0.5),

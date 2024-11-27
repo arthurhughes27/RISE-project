@@ -1,0 +1,181 @@
+---
+title: "RISE Application main"
+author: "Arthur Hughes"
+date: "2024-11-27"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+# Setup
+Load libraries, internal functions, set seed, load data
+```{r}
+library(dplyr)
+library(SurrogateRank)
+library(readr)
+library(parallel)
+library(pbmcapply)
+library(caTools)
+library(ggplot2)
+library(Metrics)
+library(xtable)
+library(here)
+library(ggrepel)
+source(here("R", "rise_screen.R")) # Screening function
+source(here("R", "rise_validate.R")) # Evaluation function
+set.seed(18062024)
+prevac_df = get(load(here("data", "processed", "prevac_merged.RData"))) 
+```
+
+# Screening Stage
+
+```{r}
+alpha = 0.05 # Nominal significance level
+beta = 0.2 # (1 - beta)*100% = desired power
+
+# Select gene expression at day 7 following injection with rVSV or placebo + clinical variables
+df = prevac_df %>% 
+  mutate(treatment = recode_factor(arm_short, "rVSV" = 1, "rVSV2" = 1, "Ad26MVA" = 1, "placebo" = 0)) %>% 
+  filter(is.na(Ab_M12) == F, 
+         Timepoint == "J7", 
+         arm_short %in% (c("placebo", "rVSV"))) %>% 
+  select(PID, Timepoint, arm_short, treatment, Ab_M12, A1BG:ZZZ3)
+
+# Total number of genes in the data
+n_genes = ncol(df %>% select(A1BG:ZZZ3))
+
+# Gene names
+gene_names <- names(df[,-c(1:5)])
+
+# Sample splitting
+## Split in 2:1, balance treatment groups
+## Save for later
+train_index = sample.split(df$treatment, SplitRatio = 0.66, group = NULL)
+# save(train_index, file = here("output","application","train_index_final.RData"))
+train_index = get(load(here("output","application","train_index_final.RData")))
+df_train = df[train_index,] # screening data
+df_test = df[!train_index,] # evaluation data
+
+X = df_train %>% select(A1BG:ZZZ3) %>% as.matrix() # Candidate surrogates
+Y = df_train %>% select(Ab_M12) %>% as.matrix() # Response
+A = df_train %>% select(treatment) %>% as.matrix() # Treatment groups
+
+res_screen = rise_screen(Y = Y, X = X, A = A,
+                         reference = "0", alpha = 0.05,
+                         power_desired = 0.8, p_correction = "BH",
+                         cores = 10)
+# Save screening results
+save(res_screen, file = here("output","application","RISE_screening_final.Rds"))
+```
+
+## Screening results
+```{r}
+res_screen = get(load(here("output","application","RISE_screening_final.Rds")))
+
+# View the top genes
+res_screen$results %>% filter(p_adjusted < 0.05) %>% arrange(p_adjusted)
+# what are the significant genes after multiple testing correction
+genes = res_screen$significant_markers
+
+##--TABLE 1 : screening results--##
+# Paste directly into latex
+res_latex = res_screen$results %>% mutate(delta_ci = paste0(round(delta, 3), " (", round(ci_lower, 3), ", ", round(ci_upper, 3), ")"),
+                                          sd_round = round(sd, 3))
+
+paste_results = res_latex %>% filter(p_adjusted < 0.05) %>% arrange(p_adjusted) %>% 
+  select(marker, delta_ci, sd_round, p_unadjusted,p_adjusted)
+myxtable <- function(x, ...) xtable(apply(x, 2, as.character), ...)
+print(myxtable(paste_results), include.rownames = FALSE)
+```
+
+# Evaluation stage 
+
+```{r}
+# Load training indices and screening results if necessary
+train_index = get(load(here("output","application","train_index_final.RData")))
+df_train = df[train_index,]
+df_test = df[!train_index,]
+
+res_screen = get(load(here("output","application","RISE_screening_final.Rds")))
+genes = res_screen$significant_markers
+
+##--VALIDATION : standardised, weighted sum of predictors--##
+X_validate = df_test %>% select(all_of(genes)) %>% as.matrix() # candidate surrogates 
+Y_validate = df_test %>% select(Ab_M12) %>% as.matrix() # response
+A_validate = df_test %>% select(treatment) %>% as.matrix() # treatment groups
+individual = T # individual evaluation of each marker
+power_desired = 0.8 
+epsilon = NULL
+plot = TRUE
+weights = res_screen[["weights"]]
+
+validate_results = rise_validate(Y_validate = Y_validate,
+                                 X_validate = X_validate,
+                                 A_validate = A_validate,
+                                 individual = T,
+                                 power_desired = 0.8,
+                                 plot = T,
+                                 markers = genes, 
+                                 weights = res_screen[["weights"]])
+
+
+validate_results$plot
+
+fig5 = validate_results$plot +
+  xlab("Month 12 EBOV-GP Binding Antibodies (rank)") +
+  ylab(expression(gamma[S]~"(rank)")) +
+  ggtitle("Ranks of primary outcome vs combined surrogate in evaluation data") +
+  guides(col = guide_legend(title="Treatment")) +
+  scale_color_manual(labels = c("Placebo","Vaccine"), values = c("#1D8A99","#c1121f")) +
+  theme_minimal(base_size = 21) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.background = element_rect(fill = 'white', color = 'white'))
+
+fig5
+
+ggsave(plot = fig5, path = here("output", "figures"),
+       filename = "figure5.pdf", 
+       units = "cm", width = 35, height = 25, dpi = 500)
+```
+
+
+```{r}
+results_mat = res_screen$results %>% arrange(log(delta)) %>% head(500)
+
+# Create a new column for significance status
+results_mat <- results_mat %>%
+  mutate(significance = ifelse(marker %in% genes, 
+                               "Significant after B-H correction", 
+                               "Not significant"))
+
+# Plot with the legend
+figs8 = results_mat %>%
+  ggplot(aes(x = -log(delta), y = -log(p_unadjusted))) + 
+  geom_point(aes(color = as.factor(significance))) + 
+  theme_minimal(base_size = 18) +
+  scale_color_manual(
+    values = c("Significant after B-H correction" = "red", 
+               "Not significant" = "black"),
+    name = "Significance"
+  ) +
+  geom_label_repel(data = results_mat %>% filter(marker %in% genes), 
+                   aes(label = marker), 
+                   size = 3, 
+                   box.padding = 0.2, # Padding around the text box
+                   point.padding = 0.2, # Padding between arrow and point
+                   segment.color = "black",
+                   max.overlaps = 20, min.segment.length = 0.05) + 
+  xlab(expression(-log(delta))) +
+  ylab(expression(-log(p))) + 
+  ggtitle("Visualisation of screening results") +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(hjust = 0.5)
+  )
+
+figs8
+
+ggsave(plot = figs8,
+       here("output","figures","figures8.pdf"), 
+       units = "cm", width = 28, height = 20)
+```
+
