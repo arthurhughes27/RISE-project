@@ -20,6 +20,7 @@ library(cowplot)
 library(grid)
 library(pbmcapply)
 library(tidyr)
+library(RColorBrewer)
 set.seed(23102024)
 ```
 
@@ -146,7 +147,7 @@ calc.truth <- function(p, prop_valid, valid_sigma, corr, mode = "simple") {
 ```
 
 # Evaluation function
-Function which repeatedly simulates data and calculates performance metrics (FPR, PFP, TPR).
+Function which repeatedly simulates data and calculates performance metrics (FPR, FDP, TPR).
 ```{r}
 # Function to simulate results (performance metrics)
 simulate_results <- function(n1, n0, p, prop_valid, n_sim, valid_sigma, corr, mode = "simple") {
@@ -234,7 +235,7 @@ simulate_results <- function(n1, n0, p, prop_valid, n_sim, valid_sigma, corr, mo
       fdr_unadjusted[k] <- 0  # set the other metrics as 0
       tpr_unadjusted[k] <- 0                 
       ppv_unadjusted[k] <- 0
-    } else if (prop_valid != 0){  # if any true positives, calculate FPR, PFP, TPR, PPV
+    } else if (prop_valid != 0){  # if any true positives, calculate FPR, FDP, TPR, PPV
       fpr_unadjusted[k] <- FP_unadjusted / (FP_unadjusted + TN_unadjusted)  # False positive rate = FP/(FP + TN)   
       fdr_unadjusted[k] <- FP_unadjusted / (TP_unadjusted + FP_unadjusted)  # Proportion of False Positives = FP/(FP + TP) 
       tpr_unadjusted[k] <- TP_unadjusted / (TP_unadjusted + FN_unadjusted)  # True Positive Rate (Sensitivity) = TP/(TP + FN)
@@ -389,33 +390,35 @@ for (i in 1:length(n_grid)){
 }
 
 metrics_fig1 = data.frame("n" = metrics_fig1[,1],
-                          "FPR" = metrics_fig1[,2])
+                          "False Positive Rate" = metrics_fig1[,2])
 
 save(metrics_fig1, file = "./output/simulation/metrics_figure1.Rdata")
 metrics_figure1 = get(load("./output/simulation/metrics_figure1.Rdata"))
 
 fig1 = metrics_fig1 %>% ggplot(aes(x = as.factor(n), 
-                                   y = FPR, 
+                                   y = FPR,
                                    fill = as.factor(n))) +
   geom_boxplot() +
   labs(title = "Observed FPR across different sample sizes",
        x = "Sample size",
-       y = "FPR",
+       y = "False Positive Rate",
        fill = "Sample Size") + 
   ylim(0,0.15) +
   geom_hline(yintercept = 0.05, colour = "red", linetype = "dashed", linewidth = 1.1) +
-  theme_minimal(base_size = 18) +
-  theme(plot.title = element_text(hjust = 0.5),
+  theme_minimal(base_size = 35) +
+  theme(plot.title = element_blank(),
+        axis.title = element_text(size = 35),
         plot.background = element_rect(fill = 'white', color = 'white'),
-        legend.position = "none")
+        legend.position = "none") +
+  scale_fill_brewer(palette = "RdYlGn")
 
 fig1
 
 ggsave(plot = fig1,
-       "./output/figures/figure1.pdf", 
+       "./output/figures/figure1.eps", 
        units = "cm", 
        width = 40, 
-       height = 25)
+       height = 25, dpi = 800)
 ```
 
 ## Figure 2
@@ -466,33 +469,35 @@ for (i in 1:length(corr_grid)){
 }
 
 metrics_fig2 = data.frame("correlation" = metrics_fig2[,1],
-                          "FPR" = metrics_fig2[,2])
+                          "False Positive Rate" = metrics_fig2[,2])
 
 save(metrics_fig2, file = "./output/simulation/metrics_figure2.Rdata")
 
 metrics_fig2 = get(load("./output/simulation/metrics_figure2.Rdata"))
 
 fig2 = metrics_fig2 %>% ggplot(aes(x = as.factor(correlation), 
-                                   y = FPR, 
+                                   y = FPR,
                                    fill = as.factor(correlation))) +
   geom_violin() +
   labs(title = "Observed FPR across different inter-predictor correlation levels",
-       x = "Inter-predictor correlation",
-       y = "FPR",
+       x = expression(sigma[corr]),
+       y = "False Positive Rate",
        fill = "Correlation") + 
   geom_hline(yintercept = 0.05, colour = "red", linetype = "dashed", linewidth = 1.1) +
-  theme_minimal(base_size = 18) +
-  theme(plot.title = element_text(hjust = 0.5),
+  theme_minimal(base_size = 35) +
+  theme(plot.title = element_blank(),
         plot.background = element_rect(fill = 'white', color = 'white'),
-        legend.position = "none")
+        legend.position = "none",
+        axis.title.x = element_text(size = 55)) +
+  scale_fill_brewer(palette = "RdYlGn")
 
 fig2
 
 ggsave(plot = fig2,
-       "./output/figures/figure2.pdf", 
+       "./output/figures/figure2.eps", 
        units = "cm", 
        width = 40, 
-       height = 25)
+       height = 25, dpi = 800)
 ```
 
 ## Figure 3
@@ -595,32 +600,34 @@ for (sigma in sigma_grid){
 
 save(metrics_fig3, file = "./output/simulation/metrics_figure3.Rdata")
 
-#metrics_fig3 = get(load("./output/simulation/metrics_figure3.Rdata"))
+metrics_fig3 = get(load("./output/simulation/metrics_figure3.Rdata"))
 
 # FDR as a function of surrogate strength
-FDR_plot_unadjusted = metrics_fig3 %>% ggplot(aes(x = avg_us, y = avg_fdr_unadjusted, color = as.factor(n))) + 
-  geom_line() + 
+FDR_plot_unadjusted = metrics_fig3 %>% ggplot(aes(x = avg_us, y = avg_fdr_unadjusted, color = as.factor(n), linetype = as.factor(n))) + 
+  geom_line(size = 1.3) + 
   geom_point() +
-  ylab("Proportion of False Positives") +
-  xlab("U_S") + 
+  ylab("False Discovery Proportion") +
+  xlab(expression(bar(U[S]))) +
+  scale_color_brewer(palette = "Set1") + 
   guides(color = guide_legend(title = "Sample size")) +
   ggtitle("Proportion of False Positives as a function of average surrogate strength - unadjusted p-values") +
-  theme_minimal(base_size = 18) +
+  theme_minimal(base_size = 24) +
   theme(plot.background = element_rect(fill = 'white', color = 'white'),
-        plot.title = element_blank())
+        plot.title = element_blank()) 
 
-TPR_plot_unadjusted  = metrics_fig3 %>% ggplot(aes(x = avg_us, y = avg_tpr_unadjusted , color = as.factor(n))) + 
-  geom_line() + 
+TPR_plot_unadjusted  = metrics_fig3 %>% ggplot(aes(x = avg_us, y = avg_tpr_unadjusted , color = as.factor(n), linetype = as.factor(n))) + 
+  geom_line(size = 1.3) + 
   geom_point() +
   ylab("Empirical power") +
-  xlab("U_S") + 
+  xlab(expression(bar(U[S]))) +
+  scale_color_brewer(palette = "Set1") + 
   guides(color = guide_legend(title = "Sample size")) +
   ggtitle("Empirical power as a function of average surrogate strength - unadjusted p-values") +
-  theme_minimal(base_size = 18) +
+  theme_minimal(base_size = 24) +
   theme(plot.background = element_rect(fill = 'white', color = 'white'),
-        plot.title = element_blank())
+        plot.title = element_blank()) 
 
-## FPR and TPR in the same grid
+## FPR and TPR in the same grid 
 TPR_patchwork = TPR_plot_unadjusted + 
   ylim(0,1) + 
   theme(legend.position = "none")
@@ -629,27 +636,44 @@ FDR_patchwork = FDR_plot_unadjusted +
   ylim(0,1) + 
   theme(legend.position = "none")
 
-legend = get_legend(metrics_fig3 %>% ggplot(aes(x = avg_us, y = avg_fdr_unadjusted, color = as.factor(n))) + 
-                      geom_line() + 
-                      geom_point() +
-                      ylab("Proportion of False Positives") +
-                      xlab("U_S") + 
-                      guides(color = guide_legend(title = "Sample size")) +
-                      ggtitle("Proportion of False Positives as a function of average surrogate strength - unadjusted p-values") +
-                      theme_minimal(base_size = 18))
+# Extract the legend
+legend <- get_legend(
+  metrics_fig3 %>% 
+    ggplot(aes(x = avg_us, 
+               y = avg_fdr_unadjusted, 
+               color = as.factor(n), 
+               linetype = as.factor(n))) + 
+    geom_line(size = 1.3) + # Adjust the line size in the plot
+    geom_point() +
+    ylab("False Discovery Proportion") +
+    xlab(expression(bar(U[S]))) +
+    scale_color_brewer(palette = "Set1") + 
+    guides(
+      color = guide_legend(title = "Sample size"),
+      linetype = guide_legend(
+        title = "Sample size",
+        override.aes = list(size = 1) # Adjust line size in legend
+      )
+    ) +
+    ggtitle("Proportion of False Positives as a function of average surrogate strength - unadjusted p-values") +
+    theme_minimal(base_size = 20) +
+    theme(
+      legend.key.width = unit(2, "cm") # Increase legend key width
+    )
+)
 
 figure3 = grid.arrange(
   arrangeGrob(TPR_patchwork, FDR_patchwork, legend, 
               ncol = 3, widths = c(1, 1, 0.3)),  # Adjust widths as needed
-  top = textGrob("Empirical Power and Proportion of False Positives as a function of average surrogate strength",
+  top = textGrob("",
                  gp = gpar(fontsize = 20))  # Adjust fontsize and fontface
 )
 
 ggsave(plot = figure3,
-       "./output/figures/figure3.pdf", 
+       "./output/figures/figure3.eps", 
        units = "cm", 
        width = 35, 
-       height = 18)
+       height = 18, dpi = 800)
 ```
 
 ## Figure 4
@@ -737,20 +761,21 @@ fig4 = ggplot(p_evaluate_long, aes(x = as.factor(variable), y = value, fill = as
     y = "P-value",
     title = expression("Evaluation stage P-values as a function of the proportion of false positives in " * gamma[S])
   ) +
-  geom_hline(yintercept = 0.05, linetype = "dashed", colour = "red") + 
-  theme_minimal(base_size = 18) +
-  theme(plot.title = element_text(hjust = 0.5),
+  geom_hline(yintercept = 0.05, linetype = "dashed", colour = "red", linewidth = 1.5) + 
+  theme_minimal(base_size = 26) +
+  theme(plot.title = element_blank(),
         plot.background = element_rect(fill = 'white', color = 'white'),
-        legend.position = "none")
+        legend.position = "none") +
+  scale_fill_brewer(palette = "Spectral")
 
 fig4
 
 
-ggsave(plot = fig4, filename = "figure4.pdf",
+ggsave(plot = fig4, filename = "figure4.eps",
        path = "./output/figures/",
        units = "cm",
-       width = 40,
-       height = 25)
+       width = 35,
+       height = 20, dpi = 800)
 ```
 
 # Supplementary Material
@@ -800,20 +825,20 @@ save(p_figs1, file = "./output/simulation/metrics_figures1.Rdata")
 metrics_figures1 = get(load("./output/simulation/metrics_figures1.Rdata"))
 
 fig_s1 = metrics_figures1 %>% ggplot(aes(x = p)) +
-  geom_histogram(binwidth = 0.03, fill = "lightblue", color = "black", alpha = 0.7, aes(y = ..density..)) +
+  geom_histogram(binwidth = 0.03, fill = "lightblue", color = "black", aes(y = ..density..)) +
   labs(title = "Distribution of P-values under the null hypothesis", x = "P-value", y = "Density") +
   xlim(0,1) +
-  theme_minimal(base_size = 18) +
-  theme(plot.title = element_text(hjust = 0.5),
+  theme_minimal(base_size = 20) +
+  theme(plot.title = element_blank(),
         plot.background = element_rect(fill = 'white', color = 'white'))
 
 fig_s1
 
 ggsave(plot = fig_s1,
-       "./output/figures/figures1.pdf", 
+       "./output/figures/figureA1.eps", 
        units = "cm", 
-       width = 35, 
-       height = 7)
+       width = 25, 
+       height = 7, dpi = 800)
 ```
 
 ## Figure S2 
@@ -930,9 +955,10 @@ metrics_figs2_tpr_long <- metrics_figs2  %>%
   dplyr::select(avg_us, Correction, Value)
 
 # Plot
-FDR_figs2 = ggplot(metrics_figs2_fdr_long, aes(x = avg_us, y = Value, linetype = Correction)) +
-  geom_line(color = "red") +
-  labs(x = "U_S", y = "Proportion of False Positives", linetype = "Correction") +
+FDR_figs2 = ggplot(metrics_figs2_fdr_long, aes(x = avg_us, y = Value, linetype = Correction, color = Correction)) +
+  geom_line(size = 1.3) +
+  scale_color_brewer(palette = "Set1") +
+  labs(x = expression(bar(U[S])), y = "False Discovery Proportion", linetype = "Correction") +
   scale_linetype_manual(values = c("avg_fdr_unadjusted" = "solid", 
                                    "avg_fdr_bonf" = "dashed",
                                    "avg_fdr_bh" = "dotted",
@@ -940,13 +966,23 @@ FDR_figs2 = ggplot(metrics_figs2_fdr_long, aes(x = avg_us, y = Value, linetype =
                         labels = c("avg_fdr_unadjusted" = "Unadjusted", 
                                    "avg_fdr_bonf" = "Bonferroni",
                                    "avg_fdr_bh" = "B-H",
+                                   "avg_fdr_by" = "B-Y")) +
+  scale_color_manual(values = c("avg_fdr_unadjusted" = brewer.pal(n = 4, name = "Set1")[1], 
+                                   "avg_fdr_bonf" = brewer.pal(n = 4, name = "Set1")[2],
+                                   "avg_fdr_bh" = brewer.pal(n = 4, name = "Set1")[3],
+                                   "avg_fdr_by" = brewer.pal(n = 4, name = "Set1")[4]),
+                     labels = c("avg_fdr_unadjusted" = "Unadjusted", 
+                                   "avg_fdr_bonf" = "Bonferroni",
+                                   "avg_fdr_bh" = "B-H",
                                    "avg_fdr_by" = "B-Y")) + 
-  theme_minimal(base_size = 18) +
-  theme(plot.background = element_rect(fill = 'white', color = 'white'))
+  theme_minimal(base_size = 24) +
+  theme(plot.title = element_blank(),
+        plot.background = element_rect(fill = 'white', color = 'white'))
 
-TPR_figs2 = ggplot(metrics_figs2_tpr_long, aes(x = avg_us, y = Value, linetype = Correction)) +
-  geom_line(color = "red") +
-  labs(x = "U_S", y = "Proportion of False Positives", linetype = "Correction") +
+TPR_figs2 = ggplot(metrics_figs2_tpr_long, aes(x = avg_us, y = Value, linetype = Correction, color = Correction)) +
+  geom_line(size = 1.3) +
+  scale_color_brewer(palette = "Set1") +
+  labs(x = expression(bar(U[S])), y = "Empirical Power", linetype = "Correction") +
   scale_linetype_manual(values = c("avg_tpr_unadjusted" = "solid", 
                                    "avg_tpr_bonf" = "dashed",
                                    "avg_tpr_bh" = "dotted",
@@ -954,39 +990,70 @@ TPR_figs2 = ggplot(metrics_figs2_tpr_long, aes(x = avg_us, y = Value, linetype =
                         labels = c("avg_tpr_unadjusted" = "Unadjusted", 
                                    "avg_tpr_bonf" = "Bonferroni",
                                    "avg_tpr_bh" = "B-H",
+                                   "avg_tpr_by" = "B-Y")) +
+  scale_color_manual(values = c("avg_tpr_unadjusted" = brewer.pal(n = 4, name = "Set1")[1], 
+                                   "avg_tpr_bonf" = brewer.pal(n = 4, name = "Set1")[2],
+                                   "avg_tpr_bh" = brewer.pal(n = 4, name = "Set1")[3],
+                                   "avg_tpr_by" = brewer.pal(n = 4, name = "Set1")[4]),
+                     labels = c("avg_tpr_unadjusted" = "Unadjusted", 
+                                   "avg_tpr_bonf" = "Bonferroni",
+                                   "avg_tpr_bh" = "B-H",
                                    "avg_tpr_by" = "B-Y")) + 
-  theme_minimal(base_size = 18) +
-  theme(plot.background = element_rect(fill = 'white', color = 'white'))
+  theme_minimal(base_size = 24) +
+  theme(plot.title = element_blank(),
+        plot.background = element_rect(fill = 'white', color = 'white'))
 
 ## FPR and TPR in the same grid
 TPR_patchwork_figs2 = TPR_figs2  + 
   ylim(0,1) + 
   theme(legend.position = "none",
-        title = element_blank())
+        plot.title = element_blank())
 
 FDR_patchwork_figs2 = FDR_figs2  + 
   ylim(0,1) + 
   theme(legend.position = "none",
-        title = element_blank())
+        plot.title = element_blank())
 
-legend = get_legend(FDR_figs2)
+legend = get_legend(ggplot(metrics_figs2_tpr_long, aes(x = avg_us, y = Value, linetype = Correction, color = Correction)) +
+  geom_line(size = 1.3) +
+  scale_color_brewer(palette = "Set1") +
+  labs(x = expression(bar(U[S])), y = "False Discovery Proportion", linetype = "Correction") +
+  scale_linetype_manual(values = c("avg_tpr_unadjusted" = "solid", 
+                                   "avg_tpr_bonf" = "dashed",
+                                   "avg_tpr_bh" = "dotted",
+                                   "avg_tpr_by" = "dotdash"),
+                        labels = c("avg_tpr_unadjusted" = "Unadjusted", 
+                                   "avg_tpr_bonf" = "Bonferroni",
+                                   "avg_tpr_bh" = "B-H",
+                                   "avg_tpr_by" = "B-Y")) +
+  scale_color_manual(values = c("avg_tpr_unadjusted" = brewer.pal(n = 4, name = "Set1")[1], 
+                                   "avg_tpr_bonf" = brewer.pal(n = 4, name = "Set1")[2],
+                                   "avg_tpr_bh" = brewer.pal(n = 4, name = "Set1")[3],
+                                   "avg_tpr_by" = brewer.pal(n = 4, name = "Set1")[4]),
+                     labels = c("avg_tpr_unadjusted" = "Unadjusted", 
+                                   "avg_tpr_bonf" = "Bonferroni",
+                                   "avg_tpr_bh" = "B-H",
+                                   "avg_tpr_by" = "B-Y")) + 
+  theme_minimal(base_size = 20) +
+  theme(plot.background = element_rect(fill = 'white', color = 'white'),
+        legend.key.width = unit(2, "cm")))
 
 figures2 = grid.arrange(
   arrangeGrob(TPR_patchwork_figs2, FDR_patchwork_figs2, legend, 
-              ncol = 3, widths = c(1, 1, 0.3)),  # Adjust widths as needed
-  top = textGrob("Empirical Power and Proportion of False Positives as a function of surrogate strength and multiple testing correction method",
-                 gp = gpar(fontsize = 18))  # Adjust fontsize and fontface
-)
+              ncol = 3, widths = c(1, 1, 0.3)))  # Adjust fontsize and fontface
+
+
+figures2
 
 ggsave(plot = figures2,
-       "./output/figures/figures2.pdf", 
+       "./output/figures/figureA2.eps", 
        units = "cm", 
-       width = 35, 
-       height = 18)
+       width = 41, 
+       height = 18, dpi = 800)
 ```
 
 ## Figure S3
-PFP and empirical power as a function of inter-predictor correlation for a fixed sample size and surrogate strength
+FDP and empirical power as a function of inter-predictor correlation for a fixed sample size and surrogate strength
 ```{r}
 alpha <- 0.05 # nominal significance level
 beta <- 0.2 # desired power for univariate surrogate test = (1-beta)*100% 
@@ -1038,43 +1105,41 @@ metrics_figs3 = get(load("./output/simulation/metrics_figures3.Rdata"))
 
 metrics_figs3 = data.frame("correlation" = metrics_figs3[,1], "fdr" = metrics_figs3[,2], "tpr" = metrics_figs3[,3])
 
-metrics_figs3 %>% ggplot(aes(x = as.factor(correlation), y = fdr))
-
-
 fdr_plot_s3 = metrics_figs3 %>% ggplot(aes(x = as.factor(correlation), y = fdr, fill = as.factor(correlation))) + 
                            geom_violin() +
                            ylim(0,1) + 
-                           ylab("Proportion of False Positives") +
-                           xlab("Inter-predictor correlation") + 
-                           ggtitle("Proportion of False Positives as a function of correlation strength") +
-                           theme_minimal(base_size = 18) +
+                           ylab("False Discovery Proportion") +
+                           xlab(expression(sigma[corr])) + 
+                           ggtitle("Proportion of False Positives as a function of inter-predictor correlation") +
+                           theme_minimal(base_size = 24) +
                            theme(plot.background = element_rect(fill = 'white', color = 'white'),
                                  plot.title = element_blank(),
-                                 legend.position = "none")
+                                 legend.position = "none",
+        axis.title.x = element_text(size = 35)) +
+  scale_fill_brewer(palette = "RdYlGn")
 
 tpr_plot_s3 = metrics_figs3 %>% ggplot(aes(x = as.factor(correlation), y = tpr, fill = as.factor(correlation))) + 
   geom_violin() +
   ylim(0,1) + 
   ylab("Empirical Power") +
-  xlab("Inter-predictor correlation") + 
-  ggtitle("Proportion of False Positives as a function of correlation strength") +
-  theme_minimal(base_size = 18) +
+  xlab(expression(sigma[corr])) + 
+  ggtitle("Proportion of False Positives as a function of inter-predictor correlation") +
+  theme_minimal(base_size = 24) +
   theme(plot.background = element_rect(fill = 'white', color = 'white'),
         plot.title = element_blank(),
-        legend.position = "none")
+        legend.position = "none",
+        axis.title.x = element_text(size = 35)) +
+  scale_fill_brewer(palette = "RdYlGn")
 
 figures3 = grid.arrange(
   arrangeGrob(tpr_plot_s3, fdr_plot_s3,  
-              ncol = 2, widths = c(1, 1)),  # Adjust widths as needed
-  top = textGrob("Empirical Power and Proportion of False Positives as a function of correlation",
-                 gp = gpar(fontsize = 20))  # Adjust fontsize and fontface
-)
+              ncol = 2, widths = c(1, 1)))
 
 ggsave(plot = figures3,
-       "./output/figures/figures3.pdf", 
+       "./output/figures/figureA3.eps", 
        units = "cm", 
        width = 35, 
-       height = 18)
+       height = 18, dpi = 800)
 ```
 
 ## Figure S4
@@ -1121,32 +1186,33 @@ for (i in 1:length(n_grid)){
 }
 
 metrics_figs4 = data.frame("n" = metrics_figs4[,1],
-                          "FPR" = metrics_figs4[,2])
+                          "False Positive Rate" = metrics_figs4[,2])
 
 save(metrics_figs4, file = "./output/simulation/metrics_figures4.Rdata")
-
+metrics_figs4 = get(load("./output/simulation/metrics_figures4.Rdata"))
 figs4 = metrics_figs4 %>% ggplot(aes(x = as.factor(n), 
                                    y = FPR, 
                                    fill = as.factor(n))) +
   geom_boxplot() +
   labs(title = "Observed FPR across different sample sizes - DGF 2",
        x = "Sample size",
-       y = "FPR",
+       y = "False Positive Rate",
        fill = "Sample Size") + 
   ylim(0,0.15) +
   geom_hline(yintercept = 0.05, colour = "red", linetype = "dashed", linewidth = 1.1) +
-  theme_minimal(base_size = 18) +
-  theme(plot.title = element_text(hjust = 0.5),
+  theme_minimal(base_size = 35) +
+  theme(plot.title = element_blank(),
         plot.background = element_rect(fill = 'white', color = 'white'),
-        legend.position = "none")
+        legend.position = "none") +
+  scale_fill_brewer(palette = "RdYlGn")
 
 figs4
 
 ggsave(plot = figs4,
-       "./output/figures/figures4.pdf", 
+       "./output/figures/figureA4.eps", 
        units = "cm", 
        width = 40, 
-       height = 25)
+       height = 25, dpi = 800)
 ```
 
 ## Figure S5
@@ -1197,33 +1263,35 @@ for (i in 1:length(corr_grid)){
 }
 
 metrics_figs5 = data.frame("correlation" = metrics_figs5[,1],
-                          "FPR" = metrics_figs5[,2])
+                          "False Positive Rate" = metrics_figs5[,2])
 
 save(metrics_figs5, file = "./output/simulation/metrics_figures5.Rdata")
 
 metrics_figs5 = get(load("./output/simulation/metrics_figures5.Rdata"))
 
 figs5 = metrics_figs5 %>% ggplot(aes(x = as.factor(correlation), 
-                                   y = FPR, 
+                                   y = FPR,
                                    fill = as.factor(correlation))) +
   geom_violin() +
   labs(title = "Observed FPR across different inter-predictor correlation levels - DGF 2",
-       x = "Inter-predictor correlation",
-       y = "FPR",
+       x = expression(sigma[corr]),
+       y = "False Positive Rate",
        fill = "Correlation") + 
   geom_hline(yintercept = 0.05, colour = "red", linetype = "dashed", linewidth = 1.1) +
-  theme_minimal(base_size = 18) +
-  theme(plot.title = element_text(hjust = 0.5),
+  theme_minimal(base_size = 35) +
+  theme(plot.title = element_blank(),
         plot.background = element_rect(fill = 'white', color = 'white'),
-        legend.position = "none")
+        legend.position = "none",
+        axis.title.x = element_text(size = 55)) +
+  scale_fill_brewer(palette = "RdYlGn")
 
 figs5
 
 ggsave(plot = figs5,
-       "./output/figures/figures5.pdf", 
+       "./output/figures/figureA5.eps", 
        units = "cm", 
        width = 40, 
-       height = 20)
+       height = 20, dpi = 800)
 ```
 
 ## Figure S6
@@ -1326,32 +1394,34 @@ for (sigma in sigma_grid){
 
 save(metrics_figs6, file = "./output/simulation/metrics_figures6.Rdata")
 
-#metrics_figs6 = get(load("./output/simulation/metrics_figures6.Rdata"))
+metrics_figs6 = get(load("./output/simulation/metrics_figures6.Rdata"))
 
 # FDR as a function of surrogate strength
-FDR_plot_unadjusted = metrics_figs6 %>% ggplot(aes(x = avg_us, y = avg_fdr_unadjusted, color = as.factor(n))) + 
-  geom_line() + 
+FDR_plot_unadjusted = metrics_figs6 %>% ggplot(aes(x = avg_us, y = avg_fdr_unadjusted, color = as.factor(n), linetype = as.factor(n))) + 
+  geom_line(size = 1.3) + 
   geom_point() +
-  ylab("Proportion of False Positives") +
-  xlab("U_S") + 
+  ylab("False Discovery Proportion") +
+  xlab(expression(bar(U[S]))) +
+  scale_color_brewer(palette = "Set1") + 
   guides(color = guide_legend(title = "Sample size")) +
   ggtitle("Proportion of False Positives as a function of average surrogate strength - unadjusted p-values") +
-  theme_minimal(base_size = 18) +
+  theme_minimal(base_size = 24) +
   theme(plot.background = element_rect(fill = 'white', color = 'white'),
-        plot.title = element_blank())
+        plot.title = element_blank()) 
 
-TPR_plot_unadjusted  = metrics_figs6 %>% ggplot(aes(x = avg_us, y = avg_tpr_unadjusted , color = as.factor(n))) + 
-  geom_line() + 
+TPR_plot_unadjusted  = metrics_figs6 %>% ggplot(aes(x = avg_us, y = avg_tpr_unadjusted , color = as.factor(n), linetype = as.factor(n))) + 
+  geom_line(size = 1.3) + 
   geom_point() +
   ylab("Empirical power") +
-  xlab("U_S") + 
+  xlab(expression(bar(U[S]))) +
+  scale_color_brewer(palette = "Set1") + 
   guides(color = guide_legend(title = "Sample size")) +
   ggtitle("Empirical power as a function of average surrogate strength - unadjusted p-values") +
-  theme_minimal(base_size = 18) +
+  theme_minimal(base_size = 24) +
   theme(plot.background = element_rect(fill = 'white', color = 'white'),
-        plot.title = element_blank())
+        plot.title = element_blank()) 
 
-## FPR and TPR in the same grid
+## FPR and TPR in the same grid 
 TPR_patchwork = TPR_plot_unadjusted + 
   ylim(0,1) + 
   theme(legend.position = "none")
@@ -1360,27 +1430,44 @@ FDR_patchwork = FDR_plot_unadjusted +
   ylim(0,1) + 
   theme(legend.position = "none")
 
-legend = get_legend(metrics_figs6 %>% ggplot(aes(x = avg_us, y = avg_fdr_unadjusted, color = as.factor(n))) + 
-                      geom_line() + 
-                      geom_point() +
-                      ylab("Proportion of False Positives") +
-                      xlab("U_S") + 
-                      guides(color = guide_legend(title = "Sample size")) +
-                      ggtitle("Proportion of False Positives as a function of average surrogate strength - unadjusted p-values") +
-                      theme_minimal(base_size = 18))
+# Extract the legend
+legend <- get_legend(
+  metrics_figs6 %>% 
+    ggplot(aes(x = avg_us, 
+               y = avg_fdr_unadjusted, 
+               color = as.factor(n), 
+               linetype = as.factor(n))) + 
+    geom_line(size = 1.3) + # Adjust the line size in the plot
+    geom_point() +
+    ylab("False Discovery Proportion") +
+    xlab(expression(bar(U[S]))) +
+    scale_color_brewer(palette = "Set1") + 
+    guides(
+      color = guide_legend(title = "Sample size"),
+      linetype = guide_legend(
+        title = "Sample size",
+        override.aes = list(size = 1) # Adjust line size in legend
+      )
+    ) +
+    ggtitle("Proportion of False Positives as a function of average surrogate strength - unadjusted p-values") +
+    theme_minimal(base_size = 20) +
+    theme(
+      legend.key.width = unit(2, "cm") # Increase legend key width
+    )
+)
 
 figures6 = grid.arrange(
   arrangeGrob(TPR_patchwork, FDR_patchwork, legend, 
               ncol = 3, widths = c(1, 1, 0.3)),  # Adjust widths as needed
-  top = textGrob("Empirical Power and Proportion of False Positives as a function of average surrogate strength - DGF 2",
+  top = textGrob("",
                  gp = gpar(fontsize = 20))  # Adjust fontsize and fontface
 )
 
 ggsave(plot = figures6,
-       "./output/figures/figures6.pdf", 
+       "./output/figures/figureA6.eps", 
        units = "cm", 
        width = 35, 
-       height = 18)
+       height = 18, dpi = 800)
 ```
 
 ## Figure S7 
@@ -1467,20 +1554,22 @@ figs7 = ggplot(p_evaluate_long, aes(x = as.factor(variable), y = value, fill = a
   labs(
     x = "Proportion of invalid surrogates",
     y = "P-value",
-    title = expression("Evaluation stage P-values as a function of the proportion of false positives in " * gamma[S] *" - DGF 2")) +
-  geom_hline(yintercept = 0.05, linetype = "dashed", colour = "red") + 
-  theme_minimal(base_size = 18) +
-  theme(plot.title = element_text(hjust = 0.5),
+    title = expression("Evaluation stage P-values as a function of the proportion of false positives in " * gamma[S])
+  ) +
+  geom_hline(yintercept = 0.05, linetype = "dashed", colour = "red", linewidth = 1.5) + 
+  theme_minimal(base_size = 26) +
+  theme(plot.title = element_blank(),
         plot.background = element_rect(fill = 'white', color = 'white'),
-        legend.position = "none")
+        legend.position = "none") +
+  scale_fill_brewer(palette = "Spectral")
 
 figs7
 
 
-ggsave(plot = figs7, filename = "figures7.pdf",
+ggsave(plot = figs7, filename = "figureA7.eps",
        path = "./output/figures/",
        units = "cm",
-       width = 40,
-       height = 25)
+       width = 35,
+       height = 20, dpi = 800)
 ```
 

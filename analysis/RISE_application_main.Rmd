@@ -20,15 +20,12 @@ library(Metrics)
 library(xtable)
 library(here)
 library(ggrepel)
+library(RColorBrewer)
 source(here("R", "rise_screen.R")) # Screening function
 source(here("R", "rise_validate.R")) # Evaluation function
 set.seed(18062024)
 prevac_df = get(load(here("data", "processed", "prevac_merged.RData"))) 
-```
 
-# Screening Stage
-
-```{r}
 alpha = 0.05 # Nominal significance level
 beta = 0.2 # (1 - beta)*100% = desired power
 
@@ -38,10 +35,14 @@ df = prevac_df %>%
   filter(is.na(Ab_M12) == F, 
          Timepoint == "J7", 
          arm_short %in% (c("placebo", "rVSV"))) %>% 
-  select(PID, Timepoint, arm_short, treatment, Ab_M12, A1BG:ZZZ3)
+  dplyr::select(PID, Timepoint, arm_short, treatment, Ab_M12, A1BG:ZZZ3)
+```
 
+# Screening Stage
+
+```{r}
 # Total number of genes in the data
-n_genes = ncol(df %>% select(A1BG:ZZZ3))
+n_genes = ncol(df %>% dplyr::select(A1BG:ZZZ3))
 
 # Gene names
 gene_names <- names(df[,-c(1:5)])
@@ -55,9 +56,9 @@ train_index = get(load(here("output","application","train_index_final.RData")))
 df_train = df[train_index,] # screening data
 df_test = df[!train_index,] # evaluation data
 
-X = df_train %>% select(A1BG:ZZZ3) %>% as.matrix() # Candidate surrogates
-Y = df_train %>% select(Ab_M12) %>% as.matrix() # Response
-A = df_train %>% select(treatment) %>% as.matrix() # Treatment groups
+X = df_train %>% dplyr::select(A1BG:ZZZ3) %>% as.matrix() # Candidate surrogates
+Y = df_train %>% dplyr::select(Ab_M12) %>% as.matrix() # Response
+A = df_train %>% dplyr::select(treatment) %>% as.matrix() # Treatment groups
 
 res_screen = rise_screen(Y = Y, X = X, A = A,
                          reference = "0", alpha = 0.05,
@@ -78,13 +79,18 @@ genes = res_screen$significant_markers
 
 ##--TABLE 1 : screening results--##
 # Paste directly into latex
-res_latex = res_screen$results %>% mutate(delta_ci = paste0(round(delta, 3), " (", round(ci_lower, 3), ", ", round(ci_upper, 3), ")"),
-                                          sd_round = round(sd, 3))
+latex_results = res_screen$results %>% 
+  arrange(p_unadjusted) %>% 
+  filter(p_adjusted < 0.05) %>% 
+  mutate(delta = round(delta, 3),
+         p_unadjusted = formatC(p_unadjusted, format = "e", digits = 1),
+         p_adjusted = formatC(p_adjusted, format = "e", digits = 1),
+         delta = paste0(round(delta, 3), " (", round(ci_lower, 3), ", ", round(ci_upper, 3), ")"),
+         sd = round(sd, 3)) %>% 
+  dplyr::select(marker, delta, sd, p_unadjusted, p_adjusted)
 
-paste_results = res_latex %>% filter(p_adjusted < 0.05) %>% arrange(p_adjusted) %>% 
-  select(marker, delta_ci, sd_round, p_unadjusted,p_adjusted)
 myxtable <- function(x, ...) xtable(apply(x, 2, as.character), ...)
-print(myxtable(paste_results), include.rownames = FALSE)
+print(myxtable(latex_results), include.rownames = FALSE)
 ```
 
 # Evaluation stage 
@@ -99,9 +105,9 @@ res_screen = get(load(here("output","application","RISE_screening_final.Rds")))
 genes = res_screen$significant_markers
 
 ##--VALIDATION : standardised, weighted sum of predictors--##
-X_validate = df_test %>% select(all_of(genes)) %>% as.matrix() # candidate surrogates 
-Y_validate = df_test %>% select(Ab_M12) %>% as.matrix() # response
-A_validate = df_test %>% select(treatment) %>% as.matrix() # treatment groups
+X_validate = df_test %>% dplyr::select(all_of(genes)) %>% as.matrix() # candidate surrogates 
+Y_validate = df_test %>% dplyr::select(Ab_M12) %>% as.matrix() # response
+A_validate = df_test %>% dplyr::select(treatment) %>% as.matrix() # treatment groups
 individual = T # individual evaluation of each marker
 power_desired = 0.8 
 epsilon = NULL
@@ -120,26 +126,42 @@ validate_results = rise_validate(Y_validate = Y_validate,
 
 validate_results$plot
 
-fig5 = validate_results$plot +
+fig5 <- validate_results$plot +
+  geom_point(size = 8) +
   xlab("Month 12 EBOV-GP Binding Antibodies (rank)") +
   ylab(expression(gamma[S]~"(rank)")) +
   ggtitle("Ranks of primary outcome vs combined surrogate in evaluation data") +
-  guides(col = guide_legend(title="Treatment")) +
-  scale_color_manual(labels = c("Placebo","Vaccine"), values = c("#1D8A99","#c1121f")) +
-  theme_minimal(base_size = 21) +
-  theme(plot.title = element_text(hjust = 0.5),
-        plot.background = element_rect(fill = 'white', color = 'white'))
+  guides(
+    col = guide_legend(
+      title = "Treatment",
+      override.aes = list(size = 10) # Increase point size in legend
+    )
+  ) +
+  scale_color_manual(
+    labels = c("Placebo", "rVSV-ZEBOV"), 
+    values = c("#7BC4F4", "#001B52")
+  ) +
+  theme_minimal(base_size = 35) +
+  theme(
+    plot.title = element_blank(),
+    axis.title.x = element_text(size = 35),
+    axis.title.y = element_text(size = 45),
+    legend.text = element_text(size = 25),  # Increase legend text size
+    legend.title = element_text(size = 35), # Increase legend title size
+    plot.background = element_rect(fill = 'white', color = 'white')
+  )
+
 
 fig5
 
 ggsave(plot = fig5, path = here("output", "figures"),
-       filename = "figure5.pdf", 
-       units = "cm", width = 35, height = 25, dpi = 500)
+       filename = "figure5.eps", 
+       units = "cm", width = 35, height = 25, dpi = 800)
 ```
 
 
 ```{r}
-results_mat = res_screen$results %>% arrange(log(delta)) %>% head(500)
+results_mat = res_screen$results %>% arrange(log(delta)) %>% head(400)
 
 # Create a new column for significance status
 results_mat <- results_mat %>%
@@ -147,35 +169,42 @@ results_mat <- results_mat %>%
                                "Significant after B-H correction", 
                                "Not significant"))
 
-# Plot with the legend
-figs8 = results_mat %>%
+figs8 <- results_mat %>%
   ggplot(aes(x = -log(delta), y = -log(p_unadjusted))) + 
-  geom_point(aes(color = as.factor(significance))) + 
-  theme_minimal(base_size = 18) +
+  geom_point(aes(color = as.factor(significance)), size = 3) + 
+  theme_minimal(base_size = 30) +
   scale_color_manual(
     values = c("Significant after B-H correction" = "red", 
                "Not significant" = "black"),
+    labels = c(
+      "Significant after B-H correction" = expression(p[adj] <= 0.05),
+      "Not significant" = expression(p[adj] > 0.05)
+    ),
     name = "Significance"
   ) +
   geom_label_repel(data = results_mat %>% filter(marker %in% genes), 
                    aes(label = marker), 
-                   size = 3, 
-                   box.padding = 0.2, # Padding around the text box
-                   point.padding = 0.2, # Padding between arrow and point
-                   segment.color = "black",
-                   max.overlaps = 20, min.segment.length = 0.05) + 
+                   size = 4, 
+                   box.padding = 0.2,           # Padding around the text box
+                   point.padding = 0.6,         # Increased padding between point and label
+                   segment.color = "black", 
+                   max.overlaps = 20, 
+                   min.segment.length = 0.05,    # Reduced the minimum segment length to make longer lines
+                   #segment.curvature = 0.1,     # Adds some curvature (optional)
+                   segment.ncp = 3) +           # Controls the number of control points for curved segments
   xlab(expression(-log(delta))) +
-  ylab(expression(-log(p))) + 
-  ggtitle("Visualisation of screening results") +
+  ylab(expression(-log(p))) +
   theme(
     legend.position = "top",
     plot.title = element_text(hjust = 0.5)
   )
 
+
+
 figs8
 
 ggsave(plot = figs8,
-       here("output","figures","figures8.pdf"), 
+       here("output","figures","figureA8.eps"), 
        units = "cm", width = 28, height = 20)
 ```
 
