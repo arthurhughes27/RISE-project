@@ -101,7 +101,7 @@ rise_screen = function(Y,
       ci_lower = -1,
       p_adjusted = p.adjust(p_unadjusted, method = p_correction)
     ) %>%
-    select(marker, epsilon, delta, sd, ci_lower, ci_upper, p_unadjusted, p_adjusted)
+    dplyr::select(marker, epsilon, delta, sd, ci_lower, ci_upper, p_unadjusted, p_adjusted)
   
   significant_markers = (results_vec %>% filter(p_adjusted < alpha))$marker
   

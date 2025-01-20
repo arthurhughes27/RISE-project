@@ -41,7 +41,8 @@ rise_validate = function(Y_validate,
                          epsilon = NULL,
                          individual = TRUE, 
                          weights = NULL,
-                         plot = TRUE){
+                         plot = TRUE,
+                         alpha = 0.05){
   
   # validity checks
   n = length(Y_validate)
@@ -102,7 +103,7 @@ rise_validate = function(Y_validate,
                          function(col_index) surrogate_test(X_validate[,markers], col_index),
                          mc.cores = 1)
     if (length(markers) > 1){
-      results_vec = cbind(colnames(X_validate[,markers]), do.call(rbind, results)) %>% as.data.frame()
+      results_vec = cbind(colnames(X_validate), do.call(rbind, results)) %>% as.data.frame()
     } else {
       results_vec = cbind(markers, do.call(rbind, results)) %>% as.data.frame()
     }
@@ -115,13 +116,13 @@ rise_validate = function(Y_validate,
         ci_lower = -1,
         p_adjusted = p.adjust(p_unadjusted, method = "BH")
       ) %>%
-      select(marker, epsilon, delta, sd, ci_lower, ci_upper, p_unadjusted, p_adjusted)
+      dplyr::select(marker, epsilon, delta, sd, ci_lower, ci_upper, p_unadjusted, p_adjusted)
   } else {
     individual_validation = NULL
   }
 
   
-  X_standard = X_validate[ ,markers] %>% scale()
+  X_standard = X_validate %>% scale()
   
   if (!is.null(weights)){
   weight_vector <- setNames(weights$weight, weights$marker)
@@ -172,7 +173,7 @@ rise_validate = function(Y_validate,
         ci_upper = delta + z_alpha * sd,
         ci_lower = -1
       ) %>%
-      select(marker, epsilon, delta, sd, ci_lower, ci_upper, p_unadjusted)
+      dplyr::select(marker, epsilon, delta, sd, ci_lower, ci_upper, p_unadjusted)
     
     
     rank_df = data.frame("treatment" = A_validate,
