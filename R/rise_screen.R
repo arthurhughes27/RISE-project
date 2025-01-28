@@ -1,22 +1,21 @@
 #' Applies the Rank-based Identification of high-dimensional SurrogatE markers
-#' screening process to identify a set of candidate surrogates for a given response
+#' (RISE) screening process to identify a set of candidate surrogates for a given response.
 #' 
-#' @param Y Numeric vector containing the primary response values
-#' @param X Numeric matrix or dataframe with each column a surrogate candidate. 
-#' The rows must be in the same order as in \code{Y}.
-#' @param A Binary vector giving the treatment values.
-#' The rows must be in the same order as in \code{Y}. 
-#' @param reference String giving the reference level (i.e. untreated group) in \code{A}.
-#' @param alpha Desired significance level for screening, defaults to 0.05. 
-#' @param power_desired value between 0 and 1 giving the user's desired power for the individual markers 
-#' to be able to detect a treatment effect. 
-#' Either this or the \code{epsilon} argument must be supplied.
-#' @param epsilon value between 0 and 1 giving the margin for the non-inferiority testing. 
-#' Either this or the \code{power_desired} argument must be supplied.
-#' @param p_correction Describes the multiple testing correction to be applied to the raw p-values. 
-#' One of \code{"holm"}, \code{"hochberg"}, \code{"hommel"}, \code{"bonferroni"}, 
-#' \code{"BH"}, \code{"BY"}, \code{"fdr"}, \code{"none"}.
-#' @param cores number of cores to commit to parallel computation. Default is 1. 
+#' @param Y Numeric vector containing the primary response values.
+#' @param X Numeric matrix or dataframe where each column represents a surrogate candidate. 
+#' Rows must correspond to those in \code{Y}.
+#' @param A Binary vector indicating the treatment values. 
+#' Rows must correspond to those in \code{Y}.
+#' @param reference String specifying the reference level (i.e., untreated group) in \code{A}.
+#' @param alpha Numeric value for the desired significance level for screening. Default is 0.05. 
+#' @param power_desired Numeric value between 0 and 1 specifying the desired power for the individual markers 
+#' to detect a treatment effect. Either this or \code{epsilon} must be supplied.
+#' @param epsilon Numeric value between 0 and 1 specifying the margin for non-inferiority testing. 
+#' Either this or \code{power_desired} must be supplied.
+#' @param p_correction Character string describing the multiple testing correction to be applied to the raw p-values. 
+#' Options are: \code{"holm"}, \code{"hochberg"}, \code{"hommel"}, \code{"bonferroni"}, 
+#' \code{"BH"}, \code{"BY"}, \code{"fdr"}, \code{"none"}. Default is \code{"none"}.
+#' @param cores Integer specifying the number of cores to use for parallel computation. Default is 1. 
 #' 
 #' @author Arthur Hughes
 #' 
@@ -24,6 +23,25 @@
 #' @import pbmcapply
 #' @import SurrogateRank
 #' 
+#' @return A list containing:
+#' \itemize{
+#'   \item \code{results}: A dataframe summarizing the results of the surrogate screening process. 
+#'   Includes columns:
+#'   \itemize{
+#'     \item \code{marker}: The name of the surrogate marker.
+#'     \item \code{epsilon}: The non-inferiority margin used in the surrogacy test.
+#'     \item \code{delta}: The estimate of the treatment effect mediated by the surrogate marker.
+#'     \item \code{sd}: The standard deviation of the delta estimate.
+#'     \item \code{ci_lower}: Lower bound of the confidence interval for \code{delta}.
+#'     \item \code{ci_upper}: Upper bound of the confidence interval for \code{delta}.
+#'     \item \code{p_unadjusted}: Raw p-value for the surrogacy test.
+#'     \item \code{p_adjusted}: P-value after applying the specified multiple testing correction.
+#'   }
+#'   \item \code{significant_markers}: A character vector of markers with adjusted p-values below \code{alpha}.
+#'   \item \code{weights}: A dataframe containing the significant markers and their corresponding weights 
+#'   (i.e., \code{delta} estimates) for constructing a weighted surrogate.
+#' }
+
 
 rise_screen = function(Y, 
                        X,
