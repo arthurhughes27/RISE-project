@@ -69,6 +69,9 @@ rise_evaluate = function(Y_evaluate,
     stop("either power_desired or epsilon argument must be specified")
   }
   
+  # Filter the input dataframe to only consider the significant markers 
+  X_evaluate = X_evaluate[,markers]
+  
   # If individual = TRUE, evaluate markers individually
   if (individual == TRUE){
     
