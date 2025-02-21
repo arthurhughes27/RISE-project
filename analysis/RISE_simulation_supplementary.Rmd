@@ -1,6 +1,0 @@
----
-title: "RISE Simulation Supplementary"
-author: "Arthur Hughes"
-date: "2024-11-26"
-output: html_document
----
