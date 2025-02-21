@@ -1,0 +1,426 @@
+---
+title: "RISE_application_ver2"
+author: "Arthur Hughes"
+date: "2025-01-15"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+# Setup
+Load packages, functions, and data. 
+```{r}
+# Packages
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(stringr)
+library(SurrogateRank)
+library(readr)
+library(parallel)
+library(pbmcapply)
+library(caTools)
+library(here)
+library(xtable)
+library(cowplot)
+library(caret)
+library(ggrepel)
+library(GSA)
+set.seed(16012025)
+
+source(here("R", "rise_screen.R")) # Screening function
+source(here("R", "rise_validate.R")) # Evaluation function
+source(here("R", "rise_evaluate.R")) # Evaluation function
+myxtable <- function(x, ...) xtable(apply(x, 2, as.character), ...) # Function to convert dataframe output into latex table output
+
+# Merged data containing characteristics, immune responses, and gene expression
+hipc_merged = get(load("~/Bureau/Work/PhD/data management/data/processed/hipc_merged.RData"))
+```
+
+Subset the data by female recipients of the 2008 inactivated influenza vaccines.
+```{r}
+# 2008 Inactivated influenza data
+hipc_flu = hipc_merged %>% 
+  filter(pathogen == "Influenza",
+         vaccine_type == "Inactivated",
+         vaccine == "TIV (2008)",
+         gender == "Female",
+         time_post_last_vax %in% c(0,1)) %>% # gene expression at day 0 or day 1
+  mutate(
+    treatment = ifelse(time_post_last_vax == 0, 0, 1), # set treatment to 0 for baseline gene expression samples and 1 for post-vax gene expression
+    response = ifelse(time_post_last_vax == 0, # set response to day 0 nAb for baseline gene expression samples and day 28 nAb for post-vax gene expression
+                      n_ab_mean_value_d0,
+                      n_ab_mean_value_d28)) %>%
+  filter(!is.na(response)) %>%  # remove samples without a response 
+  dplyr::select(treatment, response, c(a1cf:zzz3)) # select treatment, repsonse, all gene expression
+```
+
+# Screening Stage
+Apply the statistical test one-by-one to each gene in the data to identify a group of strong candidate surrogates. 
+```{r}
+# Total number of genes in the data
+n_genes = ncol(hipc_flu %>% dplyr::select(a1cf:zzz3))
+
+# Gene names
+gene_names <- names(hipc_flu[,-c(1:2)])
+
+# Sample splitting
+## Split in 2:1, balance treatment groups
+train_index = sample.split(hipc_flu$treatment, SplitRatio = 0.85, group = NULL)
+# save(train_index, file = "./output/train_index_flu.Rds")
+hipc_flu_train = hipc_flu[train_index,] # screening data
+hipc_flu_test = hipc_flu[!train_index,] # evaluation data
+
+X = hipc_flu_train %>% dplyr::select(a1cf:zzz3) %>% as.matrix() # Candidate gene expression surrogates
+Y = hipc_flu_train %>% dplyr::select(response) %>% as.matrix() # Response
+A = hipc_flu_train %>% dplyr::select(treatment) %>% as.matrix() # Treatment groups
+
+# Check the treatment effect on the primary response
+test.surrogate(yone = Y[A==1],
+               yzero = Y[A==0],
+               sone = Y[A==1],
+               szero = Y[A==0])$u.y
+
+# Screen genes in parallel
+## Desired power of 90% for new test of treatment effect based on surrogates
+## We reject if bonferroni adjusted p is below alpha = 0.05
+res_screen = rise_screen(Y = Y, X = X, A = A,
+                         reference = "0", alpha = 0.05,
+                         power_desired = 0.9, p_correction = "bonferroni",
+                         cores = 9)
+
+# Save the results as a dataframe
+res_df = res_screen$results
+```
+
+## Table 1
+Screening results from the data application - top 20 genes by adjusted p-values.
+```{r}
+# Can paste directly into latex table
+latex_results = res_screen$results %>% 
+  arrange(p_unadjusted) %>% 
+  filter(p_adjusted < 0.05) %>% 
+  mutate(marker = toupper(marker),
+         delta = round(delta, 3),
+         p_unadjusted = formatC(p_unadjusted, format = "e", digits = 1),
+         p_adjusted = formatC(p_adjusted, format = "e", digits = 1),
+         delta = paste0(round(delta, 3), " (", round(ci_lower, 3), ", ", round(ci_upper, 3), ")"),
+         sd = round(sd, 3)) %>% 
+  dplyr::select(marker, delta, sd, p_unadjusted, p_adjusted)
+
+# print latex table
+print(myxtable(latex_results %>% head(20)), include.rownames = FALSE)
+```
+
+## Table 2
+Functional annotation of 235 significant genes using DAVID. The table shows functional terms, the number ofassociated genes, and adjusted p-values for a test of term overrepresentation compared to a random sample of the same size fromthe 10,086 aligned genes.
+```{r}
+# Output string to paste into DAVID function gene enrichment tool
+david = cat(toupper(res_screen$significant_markers),sep = ", ")
+
+# Background list for DAVID
+david_background = cat(toupper(gene_names),sep = ", ")
+
+# Download the chart as a .txt file from DAVID. Load the data in and output it at a latex table. 
+david_df = read.table("./output/application/david.txt", header = TRUE, sep = "\t") 
+
+david_df = david_df %>% 
+  dplyr::select(Term, Count, Benjamini) %>% 
+  mutate(Benjamini = formatC(Benjamini, format = "e", digits = 1),
+         Term = gsub("~", "-", Term)
+)
+
+print(myxtable(david_df %>% head(10)), include.rownames = FALSE)
+```
+
+
+# Evaluation
+
+## Figure 5
+Figure 5 : Ranks of the mean neutralising antibodies against the ranks of the constructed 235-gene-combination surrogate marker in the evaluation dataset. The Spearman rank correlation coefficient is 0.79, indicating strong positive correlation.
+```{r}
+# Select only the significant genes from screening
+genes = res_screen$significant_markers
+# genes = (res_df %>% arrange(p_unadjusted) %>% head(15))$marker
+# train_index = get(load(here("output","application","train_index_final.RData")))
+hipc_flu_train = hipc_flu[train_index,]
+hipc_flu_test = hipc_flu[!train_index,]
+
+##--EVALUATION : standardised, weighted sum of predictors--##
+X_validate = hipc_flu_test %>% dplyr::select(a1cf:zzz3) %>% as.matrix() # candidate surrogates 
+Y_validate = hipc_flu_test %>% dplyr::select(response) %>% as.matrix() # response
+A_validate = hipc_flu_test %>% dplyr::select(treatment) %>% as.matrix() # treatment groups
+
+# Check treatment effect
+test.surrogate(yone = Y_validate[A_validate==1],
+               yzero = Y_validate[A_validate==0],
+               sone = Y_validate[A_validate==1],
+               szero = Y_validate[A_validate==0])$u.y
+
+
+weights = res_screen[["weights"]]  # use the absolute value of the weights from the screening stage
+weights[,2] = abs(weights[,2])
+validate_results = rise_evaluate(Y_evaluate = Y_validate,
+                                 X_evaluate = X_validate,
+                                 A_evaluate = A_validate,
+                                 individual = T,
+                                 power_desired = 0.9,
+                                 plot = T,
+                                 markers = genes, 
+                                 weights = weights)
+
+validate_results$validation_results # results for the combined predictor 
+
+# plot of ranks of primary response vs ranks of combined predictor
+fig5 <- validate_results$plot +
+  geom_point(size = 8) +
+  xlab("Mean Neutralising Antibodies (rank)") +
+  ylab(expression(gamma[S]~"(rank)")) +
+  ggtitle("Ranks of primary outcome vs combined surrogate in evaluation data") +
+  guides(
+    col = guide_legend(
+      title = "Sample",
+      override.aes = list(size = 10) # Increase point size in legend
+    )
+  ) +
+  scale_color_manual(
+    labels = c("Pre-vaccine", "Post-vaccine"), 
+    values = c("#7BC4F4", "#001B52")
+  ) +
+  theme_minimal(base_size = 35) +
+  theme(
+    plot.title = element_blank(),
+    axis.title.x = element_text(size = 35),
+    axis.title.y = element_text(size = 45),
+    legend.text = element_text(size = 25),  # Increase legend text size
+    legend.title = element_text(size = 35), # Increase legend title size
+    plot.background = element_rect(fill = 'white', color = 'white')
+  )
+
+fig5
+
+ggsave(plot = fig5, path = here("output", "figures"),
+filename = "figure5.eps",
+units = "cm", width = 35, height = 25, dpi = 800)
+
+ggsave(plot = fig5, path = here("output", "figures"),
+filename = "figure5.pdf",
+units = "cm", width = 35, height = 25, dpi = 800)
+```
+
+# Supporting Information
+## Table S1
+Supplementary Table 1: Screening results from the data application - all genes with adjusted p-values less than 0.05.
+```{r}
+# Can paste directly into latex table
+latex_results = res_screen$results %>% 
+  arrange(p_unadjusted) %>% 
+  filter(p_adjusted < 0.05) %>% 
+  mutate(marker = toupper(marker),
+         delta = round(delta, 3),
+         p_unadjusted = formatC(p_unadjusted, format = "e", digits = 1),
+         p_adjusted = formatC(p_adjusted, format = "e", digits = 1),
+         delta = paste0(round(delta, 3), " (", round(ci_lower, 3), ", ", round(ci_upper, 3), ")"),
+         sd = round(sd, 3)) %>% 
+  dplyr::select(marker, delta, sd, p_unadjusted, p_adjusted)
+
+# print latex table
+print(myxtable(latex_results), include.rownames = FALSE)
+```
+
+
+## Table S2
+Supplementary Table S2: Sensitivity analysis evaluating the effect of varying the non-inferiority margin $\epsilon$, where values closer to 0 result in fewer candidate surrogates to combine for the evaluation stage. The evaluation metric for the combined marker, $\boldsymbol{\delta_{\gamma_{S}}}$, its standard deviation, and its p-value corresponding to a test based on a desired power of 90\% are given in the table.
+```{r}
+beta_grid = c(0.99, 0.95, 0.9, 0.85, 0.8)
+res_screen_sensitivity = list()
+
+for (i in 1:length(beta_grid)){
+  res_screen_sensitivity[[i]] = rise_screen(Y = Y, X = X, A = A,
+                                     reference = "0", alpha = 0.05,
+                                     power_desired = beta_grid[i], p_correction = "bonferroni",
+                                     cores = 6)
+}
+
+# save the results
+# save(res_screen_sensitivity, file = './output/RISE_sensitivity_analysis.Rds')
+res_screen_sensitivity = get(load('./output/RISE_sensitivity_analysis.Rds'))
+
+significant_genes = list()
+n_significant_genes = rep(0,length(beta_grid))
+for (i in 1:length(beta_grid)){
+  significant_genes[[i]] = res_screen_sensitivity[[i]]$significant_markers
+  n_significant_genes[i] = length(significant_genes[[i]])
+}
+
+
+# validation
+source("./R/rise_validate.R")
+validate_results_sensitivity = list()
+for (i in 1:length(beta_grid)){
+  
+  markers = significant_genes[[i]]
+  X_validate = hipc_flu_test %>% dplyr::select(all_of(markers)) %>% as.matrix()
+  Y_validate = hipc_flu_test %>% dplyr::select(response) %>% as.matrix()
+  A_validate = hipc_flu_test %>% dplyr::select(treatment) %>% as.matrix()
+  weights = res_screen_sensitivity[[i]][["weights"]]
+  weights[,2] = abs(weights[,2])
+  validate_results_sensitivity[[i]] = rise_validate(
+                                 Y_validate = Y_validate,
+                                 X_validate = X_validate,
+                                 A_validate = A_validate,
+                                 individual = T,
+                                 power_desired = 0.9,
+                                 plot = T,
+                                 markers = markers, 
+                                 weights = weights)
+  print(validate_results_sensitivity[[i]][["validation_results"]])
+  print(beta_grid[i])
+  print(validate_results_sensitivity[[i]]$plot)
+  
+}
+
+output = bind_cols("power_screening" = beta_grid, "power_validation" = 0.8, "n_predictors" =  n_significant_genes, bind_rows(lapply(validate_results_sensitivity, function(x) x$validation_results))) %>% 
+  as.data.frame() %>% 
+  mutate(delta_ci = paste0(round(delta, 3), " (", round(ci_lower, 3), ", ", round(ci_upper, 3), ")"),
+         sd_round = round(sd, 3),
+         epsilon = round(epsilon, 3),
+         p_unadjusted = formatC(p_unadjusted, format = "e", digits = 1)) %>% 
+  dplyr::select(-marker)
+
+output
+
+results_sensitivity_latex = output %>% dplyr::select(power_screening, epsilon, power_validation, n_predictors, delta_ci, sd_round, p_unadjusted)
+print(myxtable(results_sensitivity_latex), include.rownames = FALSE)
+```
+
+```{r}
+epsilon_grid = c(0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35)
+res_screen_sensitivity = list()
+
+for (i in 1:length(epsilon_grid)){
+  res_screen_sensitivity[[i]] = rise_screen(Y = Y, X = X, A = A,
+                                     reference = "0", alpha = 0.05,
+                                     epsilon = epsilon_grid[i], p_correction = "bonferroni",
+                                     cores = 9)
+}
+
+# save the results
+save(res_screen_sensitivity, file = './output/RISE_sensitivity_analysis.Rds')
+# res_screen_sensitivity = get(load('./output/RISE_sensitivity_analysis.Rds'))
+
+significant_genes = list()
+n_significant_genes = rep(0,length(epsilon_grid))
+for (i in 1:length(epsilon_grid)){
+  significant_genes[[i]] = res_screen_sensitivity[[i]]$significant_markers
+  n_significant_genes[i] = length(significant_genes[[i]])
+}
+
+
+# validation
+source("./R/rise_validate.R")
+validate_results_sensitivity = list()
+for (i in 1:length(epsilon_grid)){
+  
+  if(n_significant_genes[i] == 0){
+    next
+  }
+  
+  markers = significant_genes[[i]]
+  X_validate = hipc_flu_test %>% dplyr::select(all_of(markers)) %>% as.matrix()
+  Y_validate = hipc_flu_test %>% dplyr::select(response) %>% as.matrix()
+  A_validate = hipc_flu_test %>% dplyr::select(treatment) %>% as.matrix()
+  weights = res_screen_sensitivity[[i]][["weights"]]
+  weights[,2] = abs(weights[,2])
+  validate_results_sensitivity[[i]] = rise_validate(
+                                 Y_validate = Y_validate,
+                                 X_validate = X_validate,
+                                 A_validate = A_validate,
+                                 individual = T,
+                                 power_desired = 0.9,
+                                 plot = T,
+                                 markers = markers, 
+                                 weights = weights)
+  print(validate_results_sensitivity[[i]][["validation_results"]])
+  print(epsilon_grid[i])
+  print(validate_results_sensitivity[[i]]$plot)
+  
+}
+
+output = bind_cols("epsilon_screen" = epsilon_grid, "n_predictors" =  n_significant_genes, bind_rows(lapply(validate_results_sensitivity, function(x) x$validation_results))) %>% 
+  as.data.frame() %>% 
+  mutate(delta_ci = paste0(round(delta, 3), " (", round(ci_lower, 3), ", ", round(ci_upper, 3), ")"),
+         sd_round = round(sd, 3),
+         p_unadjusted = formatC(p_unadjusted, format = "e", digits = 1)) %>% 
+  dplyr::select(-marker)
+
+output
+
+results_sensitivity_latex = output %>% dplyr::select(epsilon_screen, n_predictors, delta_ci, sd_round, p_unadjusted)
+myxtable <- function(x, ...) xtable(apply(x, 2, as.character), ...)
+print(myxtable(results_sensitivity_latex), include.rownames = FALSE)
+```
+
+
+
+## Figure S8
+Supplementary Figure 8: A visual method to select markers to pass the screening stage. The x-axis is the negative log of the $\delta$ values, where $0.05$ is added to avoid taking the log of 0, and the y-axis is the negative log of the raw p-value. Markers with a stronger surrogate strength appear towards the top-right of the plot. One could select markers without relying on a p-value threshold by choosing those which are most separated from the rest. In this example, the top 16 genes are labelled as they visually separate themselves. Evaluating the combined surrogacy of these genes gives $\delta 95\%\text{C.I.} = -0.01 (-1,0.009)$ corresponding to $p = 2.1e-40$. Points in red are the 235 genes which were selected according to the adjusted p-value threshold of 0.05. 
+```{r}
+genes = res_screen$significant_markers
+results_mat = res_screen$results %>% arrange(delta) %>% head(1000)
+
+# Create a new column for significance status
+results_mat <- results_mat %>%
+  mutate(significance = ifelse(marker %in% genes, 
+                               "Significant after B-H correction", 
+                               "Not significant"))
+
+# Identify the top 10 points
+top_points <- results_mat %>%
+  arrange(p_unadjusted) %>%
+  slice_head(n = 16) %>% 
+  mutate(marker = toupper(marker))
+
+figs8 <- results_mat %>%
+  ggplot(aes(x = -log(delta + 0.05), y = -log(p_unadjusted))) + 
+  geom_point(aes(color = as.factor(significance)), size = 3) + 
+  ggrepel::geom_label_repel(
+    data = top_points,
+    aes(label = marker),
+    size = 8,
+    max.overlaps = Inf,
+    arrow = arrow(length = unit(0.02, "npc")),
+    box.padding = 0.5,
+    point.padding = 0.3,
+    seed = 42,
+    min.segment.length = 0,
+    fill = "#e1e5f2",  # Background color of the label
+    label.size = 0.25  # Border thickness of the label box
+  ) +
+  theme_minimal(base_size = 25) +
+  scale_color_manual(
+    values = c(
+      "Significant after B-H correction" = "#ee6055", 
+      "Not significant" = "black"
+    ),
+    labels = c(
+      "Significant after B-H correction" = expression(p[adj] <= 0.05),
+      "Not significant" = expression(p[adj] > 0.05)
+    ),
+    name = "Significance"
+  ) +           
+  xlab(expression(-log(delta + 0.05))) +
+  ylab(expression(-log(p))) +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(hjust = 0.5)
+  )
+
+figs8
+
+
+
+ggsave(plot = figs8,
+       here("output","figures","figureA8.eps"), 
+       units = "cm", width = 40, height = 20)
+```
