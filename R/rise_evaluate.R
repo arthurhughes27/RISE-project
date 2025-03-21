@@ -39,7 +39,7 @@
 #'   surrogacy test results for each individual marker.
 #'   \item \code{plot}: If \code{plot = TRUE}, a ggplot2 object showing ranks of the primary response
 #'   versus the univariate surrogate \code{gamma}, including the Spearman rank correlation coefficient.
-#' }
+#' }weights = res_screen[["weights"]]
 
 
 rise_evaluate = function(Y_evaluate, 
@@ -137,6 +137,9 @@ rise_evaluate = function(Y_evaluate,
   X_standard = X_evaluate %>% scale()
   
   if (!is.null(weights)){
+    if(any(weights$weight == 0)){
+      weights$weight[which(weights$weight == 0)] = min(abs(weights$weight[-which(weights$weight == 0)]))
+    }
     weight_vector <- setNames(weights$weight, weights$marker)
     # Divide each column in X_standard by the corresponding weight
     if (length(markers) > 1){
