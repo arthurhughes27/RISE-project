@@ -134,7 +134,8 @@ test.surrogate.paired = function (full.data = NULL, yone = NULL, yzero = NULL, s
     n = length(yone)
     # Compute (1 - 2*alpha) CI for delta = u.y - u.s
     z.alpha = qnorm(1 - alpha)
-    ci.delta = c(dd$delta.estimate - z.alpha * dd$sd.delta, dd$delta.estimate + z.alpha * dd$sd.delta)
+    ci.delta = c(dd$delta.estimate - z.alpha * dd$sd.delta, 
+                 dd$delta.estimate + z.alpha * dd$sd.delta)
     
     # Calculate p-value corresponding to null: delta > epsilon
     p1 = pnorm(dd$delta.estimate, 

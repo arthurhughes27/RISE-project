@@ -114,7 +114,7 @@ rise_screen = function(Y,
              ss.test$ci.delta,
              ss.test$sd.delta, 
              ss.test$epsilon.used, 
-             ss.test$p))
+             ss.test$p.delta))
   }
   
   results = pbmclapply(c(1:P),

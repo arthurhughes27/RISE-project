@@ -115,13 +115,13 @@ rise_evaluate = function(Y_evaluate,
       }
       
       # compute p-value
-      p = pnorm(ss.test$delta.estimate, ss.test$epsilon.used, ss.test$sd.delta)
+      # p = pnorm(ss.test$delta.estimate, ss.test$epsilon.used, ss.test$sd.delta)
       # return delta, sd, epsilon and p-value
       return(c(ss.test$delta.estimate, 
                ss.test$ci,
                ss.test$sd.delta, 
                ss.test$epsilon.used, 
-               p))
+               ss.test$p.delta))
     }
     
     results = pbmclapply(c(1:P),
@@ -191,7 +191,7 @@ rise_evaluate = function(Y_evaluate,
                    ss.test$ci.delta,
                    ss.test$sd.delta, 
                    ss.test$epsilon.used,
-                   pnorm(ss.test$delta.estimate, ss.test$epsilon.used, ss.test$sd.delta))
+                   ss.test$p.delta)
   
   results_vec = t(res_evaluate) %>% as.data.frame()
   results_vec[,c(2:7)] = results_vec[,c(2:7)] %>% sapply(as.numeric)
