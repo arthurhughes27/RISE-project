@@ -48,9 +48,9 @@
 #' @export
 
 
-test.surrogate = function (full.data = NULL, yone = NULL, yzero = NULL, sone = NULL, 
-                           szero = NULL, epsilon = NULL, power.want.s = 0.7, u.y.hyp = NULL,
-                           alpha = 0.05, mode = "independent", test = "non.inferiority") 
+test.surrogate.paired = function (full.data = NULL, yone = NULL, yzero = NULL, sone = NULL, 
+                                  szero = NULL, epsilon = NULL, power.want.s = 0.7, u.y.hyp = NULL,
+                                  alpha = 0.05, mode = "independent", test = "non.inferiority") 
 {
   # Validity checks
   if (mode == "paired"){
@@ -75,51 +75,51 @@ test.surrogate = function (full.data = NULL, yone = NULL, yzero = NULL, sone = N
     szero = full.data[full.data[, 3] == 0, 2]
   }
   
-  # Compute treatment effects and standard errors using delta.calculate()
-  dd = delta.calculate(yone = yone, yzero = yzero, sone = sone, 
-                       szero = szero, mode = mode)
+  # Compute treatment effects and standard errors using delta.calculate.paired()
+  dd = delta.calculate.paired(yone = yone, yzero = yzero, sone = sone, 
+                              szero = szero, mode = mode)
+  
+  # If epsilon is not provided, estimate it based on power.want.s
+  if (is.null(epsilon) & mode == "independent") {
+    n1 = length(yone)
+    n0 = length(yzero)
+    
+    # Null SD under Wilcoxon/Mann-Whitney assumptions
+    sd.null = sqrt((n1 + n0 + 1) / (12 * n1 * n0))
+    
+    # Adjust quantiles for two-sided test and power calculation
+    z.alpha.2 = qnorm(1 - (alpha / 2))
+    u.s.power = 0.5 - (qnorm(1 - power.want.s) - z.alpha.2) * sd.null
+    
+    # Estimate epsilon as the difference between observed u.y (or hypothesized) and u.s under power
+    if (is.null(u.y.hyp)) {
+      epsilon = dd$u.y - u.s.power
+    } else {
+      epsilon = u.y.hyp - u.s.power
+    }
+  } else if (is.null(epsilon) & mode == "paired"){
+    # If epsilon is not provided, estimate it based on power.want.s
+    n = length(yone)
+    
+    # Null SD under paired-setting assumptions
+    sd.null = 1/(2*sqrt(n))
+    
+    # Adjust quantiles for two-sided test and power calculation
+    z.alpha.2 = qnorm(1 - (alpha / 2))
+    u.s.power = 0.5 - (qnorm(1 - power.want.s) - z.alpha.2) * sd.null
+    
+    # Estimate epsilon as the difference between observed u.y (or hypothesized) and u.s under power
+    if (is.null(u.y.hyp)) {
+      epsilon = dd$u.y - u.s.power
+    } else {
+      epsilon = u.y.hyp - u.s.power
+    }
+  }
   
   if (test == "non.inferiority"){
     # Compute upper bound of one-sided (1 - alpha) CI for delta = u.y - u.s
     z.alpha = qnorm(1 - alpha)
     ci.delta = c(-1, dd$delta.estimate + z.alpha * dd$sd.delta)  # CI = (-∞, upper bound]
-    
-    # If epsilon is not provided, estimate it based on power.want.s
-    if (is.null(epsilon) & mode == "independent") {
-      n1 = length(yone)
-      n0 = length(yzero)
-      
-      # Null SD under Wilcoxon/Mann-Whitney assumptions
-      sd.null = sqrt((n1 + n0 + 1) / (12 * n1 * n0))
-      
-      # Adjust quantiles for two-sided test and power calculation
-      z.alpha.2 = qnorm(1 - (alpha / 2))
-      u.s.power = 0.5 - (qnorm(1 - power.want.s) - z.alpha.2) * sd.null
-      
-      # Estimate epsilon as the difference between observed u.y (or hypothesized) and u.s under power
-      if (is.null(u.y.hyp)) {
-        epsilon = dd$u.y - u.s.power
-      } else {
-        epsilon = u.y.hyp - u.s.power
-      }
-    } else if (is.null(epsilon) & mode == "paired"){
-      # If epsilon is not provided, estimate it based on power.want.s
-      n = length(yone)
-      
-      # Null SD under paired-setting assumptions
-      sd.null = 1/(2*sqrt(n))
-      
-      # Adjust quantiles for two-sided test and power calculation
-      z.alpha.2 = qnorm(1 - (alpha / 2))
-      u.s.power = 0.5 - (qnorm(1 - power.want.s) - z.alpha.2) * sd.null
-      
-      # Estimate epsilon as the difference between observed u.y (or hypothesized) and u.s under power
-      if (is.null(u.y.hyp)) {
-        epsilon = dd$u.y - u.s.power
-      } else {
-        epsilon = u.y.hyp - u.s.power
-      }
-    }
     
     # Decision rule for non-inferiority:
     # If upper bound of CI is less than epsilon, surrogate is acceptable
@@ -142,11 +142,16 @@ test.surrogate = function (full.data = NULL, yone = NULL, yzero = NULL, sone = N
                dd$sd.delta)
     
     # Calculate p-value corresponding to null: delta < -epsilon
-    p2 = 1-pnorm(dd$delta.estimate, 
-                 -epsilon, 
-                 dd$sd.delta)
+    p2 = pnorm(dd$delta.estimate, 
+               -epsilon, 
+               dd$sd.delta, 
+               lower.tail = F)
+    
+    
     
     p = max(p1,p2)
+    
+    is.surrogate = p < alpha
   }
   
   # Return all relevant quantities

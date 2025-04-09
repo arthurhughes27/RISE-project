@@ -25,7 +25,7 @@
 #'   - `sd.u.s`: Standard deviation of the surrogate statistic
 #'   - `sd.delta`: Standard error of the delta estimate
 
-delta.calculate = function(full.data = NULL, yone = NULL, yzero = NULL, sone = NULL, 
+delta.calculate.paired = function(full.data = NULL, yone = NULL, yzero = NULL, sone = NULL, 
                            szero = NULL, mode = "independent") 
 {
   # If full.data is provided, extract outcome and surrogate values by treatment group

@@ -21,6 +21,12 @@
 #' @param plot Logical: If \code{TRUE}, generates a plot of ranks of the evaluation set response
 #' against the ranks of the new surrogate. Displays the Spearman correlation coefficient.
 #' @param alpha Numeric value specifying the significance level. Default is 0.05.
+#' @param mode Either \code{"independent"} (default) or \code{"paired"} depending on study design.
+#' @param test Type of test procedure to conduct. Default is \code{"non.inferiority"}, where a candidate is 
+#'        declared a valid trial-level surrogate if the treatment effect on it is at least at great as the 
+#'        treatment effect on the outcome. The alternative is \code{"two.one.sided"}, which performs two one sided 
+#'        non-inferiority tests to determine if the treatment effect is within a symmetric interval of width 2 epsilon
+#'        around the treatment effect on the outcome. 
 #' 
 #' @author Arthur Hughes
 #' 
@@ -51,7 +57,9 @@ rise_evaluate = function(Y_evaluate,
                          individual = TRUE, 
                          weights = NULL,
                          plot = TRUE,
-                         alpha = 0.05){
+                         alpha = 0.05,
+                         mode = "independent",
+                         test = "non.inferiority"){
   
   # validity checks
   n = length(Y_evaluate)
@@ -89,23 +97,28 @@ rise_evaluate = function(Y_evaluate,
       szero = X_evaluate[which(A_evaluate == 0),ind]
       
       if (is.null(epsilon)){
-        ss.test = test.surrogate(yone = yone, 
-                                 yzero = yzero, 
-                                 sone = sone, 
-                                 szero = szero, 
-                                 power.want.s = power_desired)
+        ss.test = test.surrogate.paired(yone = yone, 
+                                        yzero = yzero, 
+                                        sone = sone, 
+                                        szero = szero, 
+                                        power.want.s = power_desired,
+                                        mode = mode,
+                                        test = test)
       } else {
-        ss.test = test.surrogate(yone = yone, 
-                                 yzero = yzero, 
-                                 sone = sone, 
-                                 szero = szero, 
-                                 epsilon = epsilon)
+        ss.test = test.surrogate.paired(yone = yone, 
+                                        yzero = yzero, 
+                                        sone = sone, 
+                                        szero = szero, 
+                                        epsilon = epsilon,
+                                        mode = mode,
+                                        test = test)
       }
       
       # compute p-value
       p = pnorm(ss.test$delta.estimate, ss.test$epsilon.used, ss.test$sd.delta)
       # return delta, sd, epsilon and p-value
       return(c(ss.test$delta.estimate, 
+               ss.test$ci,
                ss.test$sd.delta, 
                ss.test$epsilon.used, 
                p))
@@ -119,16 +132,12 @@ rise_evaluate = function(Y_evaluate,
     } else {
       results_vec = cbind(markers, do.call(rbind, results)) %>% as.data.frame()
     }
-    results_vec[,c(2:5)] = results_vec[,c(2:5)] %>% sapply(as.numeric)
-    colnames(results_vec) = c("marker", "delta","sd", "epsilon", "p_unadjusted")
-    individual_evaluation = results_vec %>%
-      mutate(
-        z_alpha = qnorm(1 - alpha),
-        ci_upper = delta + z_alpha * sd,
-        ci_lower = -1,
-        p_adjusted = p.adjust(p_unadjusted, method = "BH")
-      ) %>%
-      dplyr::select(marker, epsilon, delta, sd, ci_lower, ci_upper, p_unadjusted, p_adjusted)
+    results_vec = cbind(colnames(X), do.call(rbind, results)) %>% as.data.frame()
+    results_vec[,c(2:7)] = results_vec[,c(2:7)] %>% sapply(as.numeric)
+    colnames(results_vec) = c("marker", "delta","ci_lower", "ci_upper","sd", "epsilon", "p_unadjusted")
+    results_vec = results_vec %>%
+      dplyr::select(marker, epsilon, delta, sd, ci_lower, ci_upper, p_unadjusted)
+    individual_evaluation = results_vec
   } else {
     individual_evaluation = NULL
   }
@@ -159,35 +168,35 @@ rise_evaluate = function(Y_evaluate,
   szero = gamma[which(A_evaluate == 0)]
   
   if (is.null(epsilon)){
-    ss.test = test.surrogate(yone = yone, 
-                             yzero = yzero, 
-                             sone = sone, 
-                             szero = szero, 
-                             power.want.s = power_desired)
+    ss.test = test.surrogate.paired(yone = yone, 
+                                    yzero = yzero, 
+                                    sone = sone, 
+                                    szero = szero, 
+                                    power.want.s = power_desired,
+                                    mode = mode,
+                                    test = test)
   } else {
-    ss.test = test.surrogate(yone = yone, 
-                             yzero = yzero, 
-                             sone = sone, 
-                             szero = szero, 
-                             epsilon = epsilon)
+    ss.test = test.surrogate.paired(yone = yone, 
+                                    yzero = yzero, 
+                                    sone = sone, 
+                                    szero = szero, 
+                                    epsilon = epsilon,
+                                    mode = mode,
+                                    test = test)
   }
   
   # compute p-value
   res_evaluate = c("gamma_S",
                    ss.test$delta.estimate, 
+                   ss.test$ci.delta,
                    ss.test$sd.delta, 
                    ss.test$epsilon.used,
                    pnorm(ss.test$delta.estimate, ss.test$epsilon.used, ss.test$sd.delta))
   
   results_vec = t(res_evaluate) %>% as.data.frame()
-  results_vec[c(2:5)] = results_vec[c(2:5)] %>% sapply(as.numeric)
-  colnames(results_vec) = c("marker", "delta","sd", "epsilon", "p_unadjusted")
+  results_vec[,c(2:7)] = results_vec[,c(2:7)] %>% sapply(as.numeric)
+  colnames(results_vec) = c("marker", "delta","ci_lower", "ci_upper","sd", "epsilon", "p_unadjusted")
   results_vec = results_vec %>%
-    mutate(
-      z_alpha = qnorm(1 - alpha),
-      ci_upper = delta + z_alpha * sd,
-      ci_lower = -1
-    ) %>%
     dplyr::select(marker, epsilon, delta, sd, ci_lower, ci_upper, p_unadjusted)
   
   
@@ -218,6 +227,7 @@ rise_evaluate = function(Y_evaluate,
           plot.background = element_rect(fill = 'white', color = 'white'))
   
   results_evaluate = list("X_evaluate_standardised" = X_standard,
+                          "gamma" = gamma,
                           "evaluation_results" = results_vec,
                           "individual_evaluation" = individual_evaluation,
                           "plot" = rank_plot)

@@ -16,7 +16,12 @@
 #' Options are: \code{"holm"}, \code{"hochberg"}, \code{"hommel"}, \code{"bonferroni"}, 
 #' \code{"BH"}, \code{"BY"}, \code{"fdr"}, \code{"none"}. Default is \code{"none"}.
 #' @param cores Integer specifying the number of cores to use for parallel computation. Default is 1. 
-#' 
+#' @param mode Either \code{"independent"} (default) or \code{"paired"} depending on study design.
+#' @param test Type of test procedure to conduct. Default is \code{"non.inferiority"}, where a candidate is 
+#'        declared a valid trial-level surrogate if the treatment effect on it is at least at great as the 
+#'        treatment effect on the outcome. The alternative is \code{"two.one.sided"}, which performs two one sided 
+#'        non-inferiority tests to determine if the treatment effect is within a symmetric interval of width 2 epsilon
+#'        around the treatment effect on the outcome. 
 #' @author Arthur Hughes
 #' 
 #' @import dplyr 
@@ -51,24 +56,26 @@ rise_screen = function(Y,
                        power_desired = NULL,
                        epsilon = NULL,
                        p_correction = "none", 
-                       cores = 1){
-
+                       cores = 1,
+                       mode = "independent", 
+                       test = "non.inferiority"){
+  
   # validity checks
   n = length(Y)
   P = ncol(X)
-
+  
   if(nrow(X) != n){
-   stop("Number of rows in X does not match length of Y")
+    stop("Number of rows in X does not match length of Y")
   }
-
+  
   if(length(A) != n){
-   stop("Length of A does not match length of Y")
+    stop("Length of A does not match length of Y")
   }
-
+  
   if(is.null(power_desired) & is.null(epsilon)){
-   stop("either power_desired or epsilon argument must be specified")
+    stop("either power_desired or epsilon argument must be specified")
   }
-
+  
   # Coercion of data
   X = as.matrix(X)
   Y = as.matrix(Y)
@@ -81,42 +88,44 @@ rise_screen = function(Y,
     yzero = Y[which(A == 0)]
     sone = X[which(A == 1),ind]
     szero = X[which(A == 0),ind]
-
+    
     if (is.null(epsilon)){
-    ss.test = test.surrogate(yone = yone, 
-                             yzero = yzero, 
-                             sone = sone, 
-                             szero = szero, 
-                             power.want.s = power_desired)
+      ss.test = test.surrogate.paired(yone = yone, 
+                                      yzero = yzero, 
+                                      sone = sone, 
+                                      szero = szero, 
+                                      power.want.s = power_desired,
+                                      mode = mode,
+                                      test = test)
     } else {
-    ss.test = test.surrogate(yone = yone, 
-                             yzero = yzero, 
-                             sone = sone, 
-                             szero = szero, 
-                             epsilon = epsilon)
+      ss.test = test.surrogate.paired(yone = yone, 
+                                      yzero = yzero, 
+                                      sone = sone, 
+                                      szero = szero, 
+                                      epsilon = epsilon,
+                                      mode = mode,
+                                      test = test)
     }
     
     # compute p-value
-    p = pnorm(ss.test$delta.estimate, ss.test$epsilon.used, ss.test$sd.delta)
+    # p = pnorm(ss.test$delta.estimate, ss.test$epsilon.used, ss.test$sd.delta)
     # return delta, sd, epsilon and p-value
     return(c(ss.test$delta.estimate, 
+             ss.test$ci.delta,
              ss.test$sd.delta, 
              ss.test$epsilon.used, 
-             p))
-    }
-
+             ss.test$p))
+  }
+  
   results = pbmclapply(c(1:P),
                        function(col_index) surrogate_test(X, col_index),
                        mc.cores = cores)
   
   results_vec = cbind(colnames(X), do.call(rbind, results)) %>% as.data.frame()
-  results_vec[,c(2:5)] = results_vec[,c(2:5)] %>% sapply(as.numeric)
-  colnames(results_vec) = c("marker", "delta","sd", "epsilon", "p_unadjusted")
+  results_vec[,c(2:7)] = results_vec[,c(2:7)] %>% sapply(as.numeric)
+  colnames(results_vec) = c("marker", "delta","ci_lower", "ci_upper","sd", "epsilon", "p_unadjusted")
   results_vec = results_vec %>%
     mutate(
-      z_alpha = qnorm(1 - alpha),
-      ci_upper = delta + z_alpha * sd,
-      ci_lower = -1,
       p_adjusted = p.adjust(p_unadjusted, method = p_correction)
     ) %>%
     dplyr::select(marker, epsilon, delta, sd, ci_lower, ci_upper, p_unadjusted, p_adjusted)
@@ -129,5 +138,5 @@ rise_screen = function(Y,
   results_screening = list("results" = results_vec, "significant_markers" = significant_markers, "weights" = weights)
   return(results_screening)
 }
-  
-  
+
+
