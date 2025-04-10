@@ -102,8 +102,11 @@ test.surrogate.paired = function (full.data = NULL, yone = NULL, yzero = NULL, s
     n = length(yone)
     
     # Null SD under paired-setting assumptions
-    sd.null = 1/(2*sqrt(n))
-    
+    ## First estimate the probability of ties in the responses 
+    pi = mean(yone == yzero)
+    ## Now estimate the null
+    sd.null = sqrt((1-pi)/(4*n))
+
     # Adjust quantiles for two-sided test and power calculation
     z.alpha.2 = qnorm(1 - (alpha / 2))
     u.s.power = 0.5 - (qnorm(1 - power.want.s) - z.alpha.2) * sd.null
