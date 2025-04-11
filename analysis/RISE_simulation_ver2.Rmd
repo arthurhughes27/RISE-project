@@ -1,0 +1,1939 @@
+---
+title: "Rise Simulation Main"
+author: "Arthur Hughes"
+date: "2024-11-26"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+# Setup
+```{r}
+library(ggplot2)
+library(dplyr)
+library(quantreg)
+library(Rsurrogate)
+library(SurrogateRank)
+library(MASS)
+library(reshape2)
+library(gridExtra)
+library(cowplot)
+library(grid)
+library(pbmcapply)
+library(tidyr)
+library(RColorBrewer)
+set.seed(23102024)
+
+# Load functions for RISE
+# Define the folder path
+folder_path <- "./R/"
+# Get all .R files in the folder
+r_files <- list.files(path = folder_path, pattern = "\\.R$", full.names = TRUE)
+# Source each file
+sapply(r_files, source)
+```
+
+# Data Generation Function
+Function to generate data. 
+```{r}
+gen.data <- function(n1, n0, p, prop_valid, valid_sigma, corr, mode = "simple") {
+  if (mode == "simple"){
+    
+    # calculate the number of valid and invalid surrogates
+    p_valid = prop_valid * p  %>% as.numeric()
+    p_invalid = (1 - prop_valid) * p %>% as.numeric()
+    
+    # generate primary responses from multivariate normal distributions
+    y1 <- rnorm(n1, y1_mean, y1_sd) # treated response 
+    y0 <- rnorm(n0, y0_mean, y0_sd) # untreated repsonse
+    
+    # generate candidate surrogates 
+    mm <- runif(p_invalid, min = 0.5, max = 2.5) # generate random invalid surrogate means from uniform distribution
+    ss <- runif(p_invalid, min = 0.5, max = 2)  # generate random invalid surrogate sds from uniform distribution
+    Sigma_invalid = matrix(corr, nrow = p_invalid, ncol= p_invalid) # Invalid surrogate covariance matrix
+    diag(Sigma_invalid) = ss 
+    
+    if (prop_valid != 0){ # if valid surrogates required
+      
+      # valid surrogate covariance matrix
+      if (p_valid == 1){
+        Sigma_valid = c(valid_sigma)
+        s1.valid <- y1 +  mvrnorm(n = n1, mu = 0, Sigma = Sigma_valid)
+        s0.valid <- y0 +  mvrnorm(n = n0, mu = 0, Sigma = Sigma_valid)
+      } else if (p_valid > 1){
+        
+        Sigma_valid = matrix(corr*valid_sigma, nrow = p_valid, ncol= p_valid) 
+        diag(Sigma_valid) = rep(valid_sigma, p_valid)
+        
+        # valid surrogates in treated group by perturbing primary response
+        s1.valid <- matrix(y1, nrow = n1, ncol = p_valid, byrow = TRUE) + 
+          mvrnorm(n = n1, mu = rep(0, p_valid), Sigma = Sigma_valid)
+        
+        # valid surrogates in untreated group by perturbing primary response
+        s0.valid <- matrix(y0, nrow = n0, ncol = p_valid, byrow = TRUE) + 
+          mvrnorm(n = n0, mu = rep(0, p_valid), Sigma = Sigma_valid)
+      }
+      
+      # invalid surrogates
+      if (prop_valid != 1){ # if invalid surrogates required
+        if (p_invalid > 1){
+          s1.invalid <- mvrnorm(n = n1, mu = mm, Sigma = Sigma_invalid)
+          s0.invalid <- mvrnorm(n = n0, mu = mm, Sigma = Sigma_invalid)
+        } else {
+          mm = runif(1, min = 0.5, max = 2.5) # generate random invalid
+          ss <- runif(1, min = 0.5, max = 2)
+          s1.invalid <- rnorm(n = n1, mean = mm, sd = ss)
+          s0.invalid <- rnorm(n = n0, mean = mm, sd = ss)
+        }
+        # bind candidates together 
+        s1 <- cbind(s1.valid, s1.invalid)
+        s0 <- cbind(s0.valid, s0.invalid)
+      } else {
+        s1 = s1.valid 
+        s0 = s0.valid 
+      }
+      
+    } else { # if no valid surrogates required 
+      # invalid surrogates
+      s1 <- mvrnorm(n = n1, mu = mm, Sigma = Sigma_invalid)
+      s0 <- mvrnorm(n = n0, mu = mm, Sigma = Sigma_invalid)
+    }
+    # store hypothesis truths
+    hyp <- c(rep("null false", p_valid), rep("null true", p_invalid))
+    
+    # return generated data as a list
+    return(list(y1 = y1, y0 = y0, s1 = s1, s0 = s0, hyp = hyp))
+  } else if (mode == "complex") {
+    # calculate the number of valid and invalid surrogates
+    p_valid = prop_valid * p 
+    p_invalid = (1 - prop_valid) * p
+    
+    # generate primary responses from multivariate normal distributions
+    y1 <- rnorm(n1, y1_mean, y1_sd) # treated response 
+    y0 <- rnorm(n0, y0_mean, y0_sd) # untreated repsonse
+    
+    # generate candidate surrogates 
+    lambda = runif(p_invalid, min = 0.5, max = 2.5)
+    if (prop_valid != 0){ #if valid surrogates required
+      # valid surrogate covariance matrix
+      Sigma_valid = matrix(corr*valid_sigma, nrow = p_valid, ncol= p_valid) 
+      diag(Sigma_valid) = rep(valid_sigma, p_valid)
+      s1.valid = matrix(y1^3, nrow = n1, ncol = p_valid, byrow = TRUE) + 
+        mvrnorm(n = n1, mu = rep(0, p_valid), Sigma = Sigma_valid)
+      
+      s0.valid = matrix(y0^3, nrow = n0, ncol = p_valid, byrow = TRUE) + 
+        mvrnorm(n = n0, mu = rep(0, p_valid), Sigma = Sigma_valid)
+      
+      if (prop_valid != 1){ #if invalid surrogates required
+        s0.invalid = sapply(lambda, function(rate) rexp(n0, rate))
+        s1.invalid = sapply(lambda, function(rate) rexp(n1, rate))
+        s1 <- cbind(s1.valid, s1.invalid)
+        s0 <- cbind(s0.valid, s0.invalid)
+      } else {
+        s1 = s1.valid 
+        s0 = s0.valid  
+      }
+    } else {
+      s0 = sapply(lambda, function(rate) rexp(n0, rate))
+      s1 = sapply(lambda, function(rate) rexp(n1, rate))
+    }
+    hyp <- c(rep("null false", p_valid), rep("null true", p_invalid))
+    return(list(y1 = y1, y0 = y0, s1 = s1, s0 = s0, hyp = hyp))
+  }
+}
+```
+
+# Truth function
+Function to calculate the true test statistics using asymptotic properties of U statistics. 
+```{r}
+calc.truth <- function(p, prop_valid, valid_sigma, corr, mode = "simple") {
+  # generate a dataset with a large sample size 
+  dd <- gen.data(n1 = 10000, n0 = 10000, p, prop_valid, valid_sigma, corr = corr, mode = mode)
+  
+  # find the asymptotic U statistic for Y
+  uy <- (10000 * 10000)^(-1) * wilcox.test(dd$y1, dd$y0)$statistic
+  
+  # find the asymptotic U statistic for each surrogate
+  us <- numeric(length(which(dd[["hyp"]] == "null false")))
+  for (j in which(dd[["hyp"]] == "null false")) {
+    us[j] <- (10000 * 10000)^(-1) * wilcox.test(dd$s1[, j], dd$s0[, j])$statistic
+  }
+  
+  # take the truth as the mean difference
+  delta_mean <- mean(uy - us)
+  delta_sd <- sd(uy - us)
+  return(list(uy_true = uy, 
+              us_true = us, 
+              delta_true = delta_mean, 
+              delta_true_sd = delta_sd))
+}
+```
+
+# Evaluation function
+Function which repeatedly simulates data and calculates performance metrics (FPR, FDP, TPR).
+```{r}
+# Function to simulate results (performance metrics)
+simulate_results <- function(n1, n0, p, prop_valid, n_sim, valid_sigma, corr, mode = "simple") {
+  p_unadjusted <- matrix(0, nrow = n_sim, ncol = p) # store unadjusted p_values for each candidate and for each simulation
+  fpr_unadjusted <- numeric(n_sim) # store unadjusted false positive rates per simulation
+  fdr_unadjusted <- numeric(n_sim) # store unadjusted proportion of false positives per simulation
+  tpr_unadjusted <- numeric(n_sim) # store unadjusted true positive rates (empirical power) per simulation
+  ppv_unadjusted <- numeric(n_sim) # store unadjusted positive predictive values per simulation
+  
+  p_bonf <- matrix(0, nrow = n_sim, ncol = p) # store bonferroni corrected p-values
+  fpr_bonf <- numeric(n_sim)
+  fdr_bonf <- numeric(n_sim)
+  tpr_bonf <- numeric(n_sim)
+  ppv_bonf <- numeric(n_sim)
+  
+  p_bh <- matrix(0, nrow = n_sim, ncol = p) # store benjamini-hochberg corrected p-values
+  fpr_bh <- numeric(n_sim)
+  fdr_bh <- numeric(n_sim)
+  tpr_bh <- numeric(n_sim)
+  ppv_bh <- numeric(n_sim)
+  
+  p_by <- matrix(0, nrow = n_sim, ncol = p) # store benjamini-yekutieli corrected p-values
+  fpr_by <- numeric(n_sim)
+  fdr_by <- numeric(n_sim)
+  tpr_by <- numeric(n_sim)
+  ppv_by <- numeric(n_sim)
+  
+  for (k in 1:n_sim) { # for loop to do many simulations
+    # generate data
+    data <- gen.data(n1, n0, p, prop_valid, valid_sigma, corr, mode = mode)
+    
+    # Estimate u_y
+    u_y_estimated <- test.surrogate(
+      yone = data$y1, yzero = data$y0, sone = data$y1, szero = data$y0, epsilon = 0.1
+    )$u.y
+    # u_y_true = truth$uy_true
+    # choose epsilon as maximum of estimated value of UY - 0.5 and 0
+    eps <- max(0, u_y_estimated - 0.5)
+    
+    for (j in 1:p) {  # for each candidate surrogate 
+      ss.test <- test.surrogate(
+        yone = data$y1, 
+        yzero = data$y0, 
+        sone = data$s1[, j], # jth candidate surrogate 
+        szero = data$s0[, j], 
+        epsilon = eps)
+      # compute unadjusted p-value for jth candidate surrogate
+      p_unadjusted[k, j] <- pnorm(ss.test$delta.estimate, ss.test$epsilon.used, ss.test$sd.delta)
+    }
+    # correct p-values per-simulation with bonferroni, BH, and BY. 
+    p_bonf[k, ] = p.adjust(p_unadjusted[k, ], method = "bonferroni")
+    p_bh[k, ] = p.adjust(p_unadjusted[k, ], method = "BH")
+    p_by[k, ] = p.adjust(p_unadjusted[k, ], method = "BY")
+    
+    
+    p_values_unadjusted = p_unadjusted[k, ]
+    # Classify test outcomes for uncorrected p-values
+    TP_unadjusted <- sum(data[["hyp"]] == "null false" & p_values_unadjusted < alpha) # true positives
+    FP_unadjusted <- sum(data[["hyp"]] == "null true" & p_values_unadjusted < alpha) # false positives
+    TN_unadjusted <- sum(data[["hyp"]] == "null true" & p_values_unadjusted >= alpha) # true negatives
+    FN_unadjusted <- sum(data[["hyp"]] == "null false" & p_values_unadjusted >= alpha) # false negatives
+    
+    # repeat for each correction method
+    p_values_bonf = p_bonf[k, ]
+    TP_bonf <- sum(data[["hyp"]] == "null false" & p_values_bonf < alpha)
+    FP_bonf <- sum(data[["hyp"]] == "null true" & p_values_bonf < alpha)
+    TN_bonf <- sum(data[["hyp"]] == "null true" & p_values_bonf >= alpha)
+    FN_bonf <- sum(data[["hyp"]] == "null false" & p_values_bonf >= alpha)
+    
+    p_values_bh = p_bh[k, ]
+    TP_bh <- sum(data[["hyp"]] == "null false" & p_values_bh < alpha)
+    FP_bh <- sum(data[["hyp"]] == "null true" & p_values_bh < alpha)
+    TN_bh <- sum(data[["hyp"]] == "null true" & p_values_bh >= alpha)
+    FN_bh <- sum(data[["hyp"]] == "null false" & p_values_bh >= alpha)
+    
+    p_values_by = p_by[k, ]
+    TP_by <- sum(data[["hyp"]] == "null false" & p_values_by < alpha)
+    FP_by <- sum(data[["hyp"]] == "null true" & p_values_by < alpha)
+    TN_by <- sum(data[["hyp"]] == "null true" & p_values_by >= alpha)
+    FN_by <- sum(data[["hyp"]] == "null false" & p_values_by >= alpha)
+    
+    
+    if (prop_valid == 0){ # if no true surrogates we only calculate the false positive rate
+      fpr_unadjusted[k] <- FP_unadjusted / (FP_unadjusted + TN_unadjusted) # FPR = FP/(FP + TN)                 # Proportion of false positives
+      fdr_unadjusted[k] <- 0  # set the other metrics as 0
+      tpr_unadjusted[k] <- 0                 
+      ppv_unadjusted[k] <- 0
+    } else if (prop_valid != 0){  # if any true positives, calculate FPR, FDP, TPR, PPV
+      fpr_unadjusted[k] <- FP_unadjusted / (FP_unadjusted + TN_unadjusted)  # False positive rate = FP/(FP + TN)   
+      fdr_unadjusted[k] <- FP_unadjusted / (TP_unadjusted + FP_unadjusted)  # Proportion of False Positives = FP/(FP + TP) 
+      tpr_unadjusted[k] <- TP_unadjusted / (TP_unadjusted + FN_unadjusted)  # True Positive Rate (Sensitivity) = TP/(TP + FN)
+      ppv_unadjusted[k] <- TP_unadjusted / (TP_unadjusted + FP_unadjusted)  # Positive Predictive Value = TP/(TP + FP)
+      
+      # repeat for all the correction methods
+      fpr_bonf[k] <- FP_bonf / (FP_bonf + TN_bonf)                 
+      fdr_bonf[k] <- FP_bonf / (TP_bonf + FP_bonf)                  
+      tpr_bonf[k] <- TP_bonf / (TP_bonf + FN_bonf)                
+      ppv_bonf[k] <- TP_bonf / (TP_bonf + FP_bonf)                 
+      
+      fpr_bh[k] <- FP_bh / (FP_bh + TN_bh)                
+      fdr_bh[k] <- FP_bh / (TP_bh + FP_bh)                 
+      tpr_bh[k] <- TP_bh / (TP_bh + FN_bh)                  
+      ppv_bh[k] <- TP_bh / (TP_bh + FP_bh)                
+      
+      fpr_by[k] <- FP_by / (FP_by + TN_by)                 
+      fdr_by[k] <- FP_by / (TP_by + FP_by)                
+      tpr_by[k] <- TP_by / (TP_by + FN_by)                 
+      ppv_by[k] <- TP_by / (TP_by + FP_by)                 
+    }
+    # print progress within simulation runs
+    # print(paste0("Sigma = ", valid_sigma, ", p = ", p, ", n = ", n, " : simulation ", k, " of ", n_sim))
+  }
+  
+  # Where we have NA in our metrics due to division by 0 
+  # (i.e. in particular, where we do not identify any positives)
+  # replace with a 0 
+  fpr_unadjusted[is.nan(fpr_unadjusted)] <- 0
+  fdr_unadjusted[is.nan(fdr_unadjusted)] <- 0
+  tpr_unadjusted[is.nan(tpr_unadjusted)] <- 0
+  ppv_unadjusted[is.nan(ppv_unadjusted)] <- 0
+  
+  fpr_bonf[is.nan(fpr_bonf)] <- 0
+  fdr_bonf[is.nan(fdr_bonf)] <- 0
+  tpr_bonf[is.nan(tpr_bonf)] <- 0
+  ppv_bonf[is.nan(ppv_bonf)] <- 0
+  
+  fpr_bh[is.nan(fpr_bh)] <- 0
+  fdr_bh[is.nan(fdr_bh)] <- 0
+  tpr_bh[is.nan(tpr_bh)] <- 0
+  ppv_bh[is.nan(ppv_bh)] <- 0
+  
+  fpr_by[is.nan(fpr_by)] <- 0
+  fdr_by[is.nan(fdr_by)] <- 0
+  tpr_by[is.nan(tpr_by)] <- 0
+  ppv_by[is.nan(ppv_by)] <- 0
+  
+  # calculate the mean metrics across simulations
+  avg_fpr_unadjusted <- mean(fpr_unadjusted)
+  avg_fdr_unadjusted <- mean(fdr_unadjusted)
+  avg_tpr_unadjusted <- mean(tpr_unadjusted)
+  avg_ppv_unadjusted <- mean(ppv_unadjusted)
+  
+  avg_fpr_bonf <- mean(fpr_bonf)
+  avg_fdr_bonf <- mean(fdr_bonf)
+  avg_tpr_bonf <- mean(tpr_bonf)
+  avg_ppv_bonf <- mean(ppv_bonf)
+  
+  avg_fpr_bh <- mean(fpr_bh)
+  avg_fdr_bh <- mean(fdr_bh)
+  avg_tpr_bh <- mean(tpr_bh)
+  avg_ppv_bh <- mean(ppv_bh)
+  
+  avg_fpr_by <- mean(fpr_by)
+  avg_fdr_by <- mean(fdr_by)
+  avg_tpr_by <- mean(tpr_by)
+  avg_ppv_by <- mean(ppv_by)
+  
+  # store the metrics in lists per correction method
+  metrics_unadjusted = list("avg_fpr" = avg_fpr_unadjusted,
+                            "avg_fdr" = avg_fdr_unadjusted,
+                            "avg_tpr" = avg_tpr_unadjusted,
+                            "avg_ppv" = avg_ppv_unadjusted)
+  
+  metrics_bonf = list("avg_fpr" = avg_fpr_bonf,
+                      "avg_fdr" = avg_fdr_bonf,
+                      "avg_tpr" = avg_tpr_bonf,
+                      "avg_ppv" = avg_ppv_bonf)
+  
+  metrics_bh = list("avg_fpr" = avg_fpr_bh,
+                    "avg_fdr" = avg_fdr_bh,
+                    "avg_tpr" = avg_tpr_bh,
+                    "avg_ppv" = avg_ppv_bh)
+  
+  metrics_by = list("avg_fpr" = avg_fpr_by,
+                    "avg_fdr" = avg_fdr_by,
+                    "avg_tpr" = avg_tpr_by,
+                    "avg_ppv" = avg_ppv_by)
+  
+  metrics = list("metrics_unadjusted" = metrics_unadjusted, 
+                 "metrics_bonf" = metrics_bonf,
+                 "metrics_bh" = metrics_bh,
+                 "metrics_by" = metrics_by)
+  
+  # print progress of simulation number
+  # print(paste0("p = ", p, ", n = ", n, " : simulation complete!"))
+  
+  p_values = list("p_unadjusted" = p_unadjusted, 
+                  "p_bonf" = p_bonf,
+                  "p_bh" = p_bh,
+                  "p_by" = p_by)
+  # output of function are the p-value lists and the performance metrics
+  return(list("p_values" = p_values, "metrics"= metrics))
+}
+```
+# Main 
+## Figure 1
+Data generation process 1, scenario 1: boxplots of observed false positive rates against different sample sizes in the uncorrelated setting. The nominal significance level $\alpha = 0.05$ is plotted as a dashed red line.
+```{r}
+# Set parameters
+alpha <- 0.05 # nominal significance level
+beta <- 0.2 # desired power for univariate surrogate test = (1-beta)*100% 
+s0_mean <- 0 # invalid surrogate mean value in untreated group
+s0_sd <- 1 # invalid surrogate sd value in untreated group
+s1_mean <- 0 # invalid surrogate mean value in treated group
+s1_sd <- 2 # invalid surrogate sd value in treated group
+y0_mean <- 0 # primary response mean value in untreated group
+y0_sd <- 1 # primary response sd value in untreated group
+y1_mean <- 3 # primary response mean value in treated group
+y1_sd <- 1 # primary response sd value in treated group
+p <- 500 # total number of predictors
+prop_valid <- 0 # proportion of predictors which are valid surrogates
+p_valid <- prop_valid * p # number of valid surrogates
+p_invalid = (1 - prop_valid) * p # number of invalid surrogates
+n_sim = 500 # number of simulations
+corr = 0
+
+n_grid = seq(10,100,10)
+
+metrics_fig1 = matrix(0,nrow = length(n_grid)*n_sim, ncol = 2)
+
+for (i in 1:length(n_grid)){
+  for (j in 1:n_sim){
+    res <- simulate_results(n1 = n_grid[i] / 2, 
+                            n0 = n_grid[i] / 2, 
+                            p = p, 
+                            prop_valid = 0, 
+                            n_sim = 1, 
+                            valid_sigma,
+                            corr = 0, 
+                            mode = "simple")
+    
+    # p_values = append(p_values,list(res[["p_values"]][["p_unadjusted"]]))
+    
+    # Append results to data frame
+    
+    metrics_fig1[(i-1)*(n_sim) + j,1] = n_grid[i]
+    metrics_fig1[(i-1)*(n_sim) + j,2] = res[["metrics"]][["metrics_unadjusted"]][["avg_fpr"]]
+    print(paste0("Sample size : ", n_grid[i], ", simulation ", j, " of ", n_sim, " complete." ))
+  }
+}
+
+metrics_fig1 = data.frame("n" = metrics_fig1[,1],
+                          "False Positive Rate" = metrics_fig1[,2])
+
+save(metrics_fig1, file = "./output/simulation/metrics_figure1.Rdata")
+metrics_figure1 = get(load("./output/simulation/metrics_figure1.Rdata"))
+
+fig1 = metrics_fig1 %>% ggplot(aes(x = as.factor(n), 
+                                   y = FPR)) +
+  geom_boxplot() +
+  labs(title = "Observed FPR across different sample sizes",
+       x = "Sample size",
+       y = "False Positive Rate",
+       fill = "Sample Size") + 
+  ylim(0,0.15) +
+  geom_hline(yintercept = 0.05, colour = "maroon", linetype = "longdash", linewidth = 1.5) +
+  theme_minimal(base_size = 35) +
+  theme(plot.title = element_blank(),
+        axis.title = element_text(size = 35),
+        plot.background = element_rect(fill = 'white', color = 'white'),
+        legend.position = "none") +
+  scale_fill_brewer(palette = "RdYlGn")
+
+fig1
+
+ggsave(plot = fig1,
+       "./output/figures/figure1.eps", 
+       units = "cm", 
+       width = 40, 
+       height = 25, dpi = 800)
+
+ggsave(plot = fig1,
+       "./output/figures/figure1.pdf", 
+       units = "cm", 
+       width = 40, 
+       height = 25, dpi = 800)
+```
+
+## Figure 2
+Data generation process 1, scenario 2: empirical power (left) and false discovery proportion (right) prior to multiple testing corrections as a function of average surrogate strength ($\bar{U_{S}}$) for three different sample sizes. 
+```{r}
+# Set parameters
+alpha <- 0.05 # nominal significance level
+beta <- 0.2 # desired power for univariate surrogate test = (1-beta)*100% 
+s0_mean <- 0 # invalid surrogate mean value in untreated group
+s0_sd <- 1 # invalid surrogate sd value in untreated group
+s1_mean <- 0 # invalid surrogate mean value in treated group
+s1_sd <- 2 # invalid surrogate sd value in treated group
+y0_mean <- 0 # primary response mean value in untreated group
+y0_sd <- 1 # primary response sd value in untreated group
+y1_mean <- 3 # primary response mean value in treated group
+y1_sd <- 1 # primary response sd value in treated group
+n <- 50 # total sample size
+n0 <- n / 2 # treated sample size 
+n1 <- n / 2 # untreated sample size 
+p <- 500 # total number of predictors
+prop_valid <- 0 # proportion of predictors which are valid surrogates
+p_valid <- prop_valid * p # number of valid surrogates
+p_invalid = (1 - prop_valid) * p # number of invalid surrogates
+n_sim = 500 # number of simulations
+
+corr_grid = seq(0,0.5,0.1)
+
+metrics_fig2 = matrix(0,nrow = length(corr_grid)*n_sim, ncol = 2)
+
+for (i in 1:length(corr_grid)){
+  for (j in 1:n_sim){
+    res <- simulate_results(n1 = n / 2, 
+                            n0 = n / 2, 
+                            p = p, 
+                            prop_valid = 0, 
+                            n_sim = 1, 
+                            corr = corr_grid[i], 
+                            mode = "simple")
+    
+    # p_values = append(p_values,list(res[["p_values"]][["p_unadjusted"]]))
+    
+    # Append results to data frame
+    
+    metrics_fig2[(i-1)*(n_sim) + j,1] = corr_grid[i]
+    metrics_fig2[(i-1)*(n_sim) + j,2] = res[["metrics"]][["metrics_unadjusted"]][["avg_fpr"]]
+    print(paste0("Correlation : ", corr_grid[i], ", simulation ", j, " of ", n_sim, " complete." ))
+  }
+}
+
+metrics_fig2 = data.frame("correlation" = metrics_fig2[,1],
+                          "False Positive Rate" = metrics_fig2[,2])
+
+save(metrics_fig2, file = "./output/simulation/metrics_figure2.Rdata")
+
+metrics_fig2 = get(load("./output/simulation/metrics_figure2.Rdata"))
+
+fig2 <- metrics_fig2 %>% 
+  ggplot(aes(
+    x = as.factor(correlation), 
+    y = FPR,
+    fill = correlation  # Map 'correlation' directly to 'fill' aesthetic
+  )) +
+  geom_violin() +
+  labs(title = "Observed FPR across different inter-predictor correlation levels",
+       x = expression(sigma[corr]),
+       y = "False Positive Rate",
+       fill = "Correlation") + 
+  geom_hline(yintercept = 0.05, colour = "maroon", linetype = "longdash", linewidth = 1, alpha = 0.6) +
+  theme_minimal(base_size = 35) +
+  theme(plot.title = element_blank(),
+        plot.background = element_rect(fill = 'white', color = 'white'),
+        legend.position = "none",
+        axis.title.x = element_text(size = 55)) +
+  scale_fill_gradient2(low = "white", mid = "lightcoral", high = "red", midpoint = 0.25)
+
+fig2
+
+ggsave(plot = fig2,
+       "./output/figures/figure2.eps", 
+       units = "cm", 
+       width = 40, 
+       height = 25, dpi = 800)
+
+ggsave(plot = fig2,
+       "./output/figures/figure2.pdf", 
+       units = "cm", 
+       width = 40, 
+       height = 25, dpi = 800)
+```
+
+## Figure 3
+Data generation process 1, scenario 2: empirical power (left) and false discovery proportion (right) prior to multiple testing corrections as a function of average surrogate strength ($\bar{U_{S}}$) for three different sample sizes. 
+
+```{r}
+# round(mean(calc.truth(p, prop_valid, valid_sigma = 244, corr, mode = "simple")$us_true),2)
+# round(mean(calc.truth(p, prop_valid, valid_sigma = 68, corr, mode = "simple")$us_true),2)
+# round(mean(calc.truth(p, prop_valid, valid_sigma = 30, corr, mode = "simple")$us_true),2)
+# round(mean(calc.truth(p, prop_valid, valid_sigma = 15, corr, mode = "simple")$us_true),2)
+# round(mean(calc.truth(p, prop_valid, valid_sigma = 9, corr, mode = "simple")$us_true),2)
+# round(mean(calc.truth(p, prop_valid, valid_sigma = 5.5, corr, mode = "simple")$us_true),2)
+# round(mean(calc.truth(p, prop_valid, valid_sigma = 3, corr, mode = "simple")$us_true),2)
+# round(mean(calc.truth(p, prop_valid, valid_sigma = 1.8, corr, mode = "simple")$us_true),2)
+# round(mean(calc.truth(p, prop_valid, valid_sigma = 0.65, corr, mode = "simple")$us_true),2)
+# round(mean(calc.truth(p, prop_valid, valid_sigma = 0.01, corr, mode = "simple")$us_true),2)
+
+# Set up the values to simulate
+alpha <- 0.05 # nominal significance level
+beta <- 0.2 # desired power for univariate surrogate test = (1-beta)*100% 
+s0_mean <- 0 # invalid surrogate mean value in untreated group
+s0_sd <- 1 # invalid surrogate sd value in untreated group
+s1_mean <- 0 # invalid surrogate mean value in treated group
+s1_sd <- 2 # invalid surrogate sd value in treated group
+y0_mean <- 0 # primary response mean value in untreated group
+y0_sd <- 1 # primary response sd value in untreated group
+y1_mean <- 3 # primary response mean value in treated group
+y1_sd <- 1 # primary response sd value in treated group
+p <- 500 # total number of predictors
+sigma_grid = c(0.01,0.65,1.8,3,5.5,9,15,30,68,244) # values of sigma
+n_grid <- c(30,50,100) # 3 sample sizes
+n_sim = 500
+prop_valid = 0.1
+corr = 0
+
+# Initialise an empty list for p-values and dataframe for metrics
+p_values = list()
+metrics_fig3 <- data.frame(
+  n = integer(), 
+  p = integer(), 
+  sigma_S = numeric(),
+  avg_us = numeric(),
+  avg_fpr_unadjusted = numeric(),
+  avg_fdr_unadjusted = numeric(),
+  avg_tpr_unadjusted = numeric(),
+  avg_ppv_unadjusted = numeric(),
+  avg_fpr_bonf = numeric(),
+  avg_fdr_bonf = numeric(),
+  avg_tpr_bonf = numeric(),
+  avg_ppv_bonf = numeric(),
+  avg_fpr_bh = numeric(),
+  avg_fdr_bh = numeric(),
+  avg_tpr_bh = numeric(),
+  avg_ppv_bh = numeric(),
+  avg_fpr_by = numeric(),
+  avg_fdr_by = numeric(),
+  avg_tpr_by = numeric(),
+  avg_ppv_by = numeric()
+)
+
+# Perform simulations over grid
+for (sigma in sigma_grid){
+  avg_us = round(mean(calc.truth(p, prop_valid, valid_sigma = sigma, corr, mode = "simple")$us_true),2)
+  for (n in n_grid) {
+    res <- simulate_results(n1 = n / 2, 
+                            n0 = n / 2, 
+                            p = p, 
+                            prop_valid, 
+                            n_sim = n_sim, 
+                            valid_sigma = sigma,
+                            corr = 0, 
+                            mode = "simple")
+    
+    # p_values = append(p_values,list(res[["p_values"]][["p_unadjusted"]]))
+    
+    # Append results to data frame
+    metrics_fig3 <- rbind(metrics_fig3, data.frame(
+      n = n, p = p,
+      sigma_S = sigma,
+      avg_us = avg_us,
+      avg_fpr_unadjusted = res[["metrics"]][["metrics_unadjusted"]][["avg_fpr"]], 
+      avg_fdr_unadjusted = res[["metrics"]][["metrics_unadjusted"]][["avg_fdr"]], 
+      avg_tpr_unadjusted = res[["metrics"]][["metrics_unadjusted"]][["avg_tpr"]],
+      avg_ppv_unadjusted = res[["metrics"]][["metrics_unadjusted"]][["avg_ppv"]],
+      avg_fpr_bonf = res[["metrics"]][["metrics_bonf"]][["avg_fpr"]], 
+      avg_fdr_bonf = res[["metrics"]][["metrics_bonf"]][["avg_fdr"]], 
+      avg_tpr_bonf = res[["metrics"]][["metrics_bonf"]][["avg_tpr"]],
+      avg_ppv_bonf = res[["metrics"]][["metrics_bonf"]][["avg_ppv"]],
+      avg_fpr_bh = res[["metrics"]][["metrics_bh"]][["avg_fpr"]], 
+      avg_fdr_bh = res[["metrics"]][["metrics_bh"]][["avg_fdr"]], 
+      avg_tpr_bh = res[["metrics"]][["metrics_bh"]][["avg_tpr"]],
+      avg_ppv_bh = res[["metrics"]][["metrics_bh"]][["avg_ppv"]],
+      avg_fpr_by = res[["metrics"]][["metrics_by"]][["avg_fpr"]], 
+      avg_fdr_by = res[["metrics"]][["metrics_by"]][["avg_fdr"]], 
+      avg_tpr_by = res[["metrics"]][["metrics_by"]][["avg_tpr"]],
+      avg_ppv_by = res[["metrics"]][["metrics_by"]][["avg_ppv"]]
+    ))
+    print(n)
+  }
+}
+
+save(metrics_fig3, file = "./output/simulation/metrics_figure3.Rdata")
+
+metrics_fig3 = get(load("./output/simulation/metrics_figure3.Rdata"))
+
+# FDR as a function of surrogate strength
+FDR_plot_unadjusted = metrics_fig3 %>% ggplot(aes(x = avg_us, y = avg_fdr_unadjusted, color = as.factor(n), linetype = as.factor(n))) + 
+  geom_line(size = 1.3) + 
+  geom_point() +
+  ylab("False Discovery Proportion") +
+  xlab(expression(bar(U[S]))) +
+  scale_color_brewer(palette = "Set1") + 
+  guides(color = guide_legend(title = "Sample size")) +
+  ggtitle("Proportion of False Positives as a function of average surrogate strength - unadjusted p-values") +
+  theme_minimal(base_size = 24) +
+  geom_hline(yintercept = 0.05, colour = "maroon", linetype = "longdash", linewidth = 1, alpha = 0.6) +
+  theme(plot.background = element_rect(fill = 'white', color = 'white'),
+        plot.title = element_blank()) 
+
+TPR_plot_unadjusted  = metrics_fig3 %>% ggplot(aes(x = avg_us, y = avg_tpr_unadjusted , color = as.factor(n), linetype = as.factor(n))) + 
+  geom_line(size = 1.3) + 
+  geom_point() +
+  ylab("Empirical power") +
+  xlab(expression(bar(U[S]))) +
+  scale_color_brewer(palette = "Set1") + 
+  guides(color = guide_legend(title = "Sample size")) +
+  ggtitle("Empirical power as a function of average surrogate strength - unadjusted p-values") +
+  theme_minimal(base_size = 24) +
+  theme(plot.background = element_rect(fill = 'white', color = 'white'),
+        plot.title = element_blank()) 
+
+## FPR and TPR in the same grid 
+TPR_patchwork = TPR_plot_unadjusted + 
+  ylim(0,1) + 
+  theme(legend.position = "none")
+
+FDR_patchwork = FDR_plot_unadjusted + 
+  ylim(0,1) + 
+  theme(legend.position = "none")
+
+# Extract the legend
+legend <- get_legend(
+  metrics_fig3 %>% 
+    ggplot(aes(x = avg_us, 
+               y = avg_fdr_unadjusted, 
+               color = as.factor(n), 
+               linetype = as.factor(n))) + 
+    geom_line(size = 1.3) + # Adjust the line size in the plot
+    geom_point() +
+    ylab("False Discovery Proportion") +
+    xlab(expression(bar(U[S]))) +
+    scale_color_brewer(palette = "Set1") + 
+    guides(
+      color = guide_legend(title = "Sample size"),
+      linetype = guide_legend(
+        title = "Sample size",
+        override.aes = list(size = 1) # Adjust line size in legend
+      )
+    ) +
+    ggtitle("Proportion of False Positives as a function of average surrogate strength - unadjusted p-values") +
+    theme_minimal(base_size = 20) +
+    theme(
+      legend.key.width = unit(2, "cm") # Increase legend key width
+    )
+)
+
+figure3 = grid.arrange(
+  arrangeGrob(TPR_patchwork, FDR_patchwork, legend, 
+              ncol = 3, widths = c(1, 1, 0.3)),  # Adjust widths as needed
+  top = textGrob("",
+                 gp = gpar(fontsize = 20))  # Adjust fontsize and fontface
+)
+
+ggsave(plot = figure3,
+       "./output/figures/figure3.eps", 
+       units = "cm", 
+       width = 35, 
+       height = 18, dpi = 800)
+
+ggsave(plot = figure3,
+       "./output/figures/figure3.pdf", 
+       units = "cm", 
+       width = 35, 
+       height = 18, dpi = 800)
+```
+
+## Figure 4
+Data generation process 1: the distributions of the p-values in the evaluation step are examined as a function of the false discovery proportion which make up $\widehat{\gamma}_{\mathcal{S}}$, which consists of a combination of $20$ predictors. The sample size is $n = 50$ and the valid surrogate strength is $\widehat{U_{S_{j}}} = 0.9$. The nominal significance level $\alpha = 0.05$ is plotted as a dashed red line. Desired power for the new surrogate was fixed at $80\%$. 
+```{r}
+# Step 1 : construct a marker as a combination of true and false positives
+# Keep true positives strong on average : U_Y = 0.9
+source("./R/rise_evaluate.R")
+source("./R/rise_screen.R")
+alpha <- 0.05 # nominal significance level
+beta <- 0.2 # desired power for univariate surrogate test = (1-beta)*100% 
+s0_mean <- 0 # invalid surrogate mean value in untreated group
+s0_sd <- 1 # invalid surrogate sd value in untreated group
+s1_mean <- 0 # invalid surrogate mean value in treated group
+s1_sd <- 2 # invalid surrogate sd value in treated group
+y0_mean <- 0 # primary response mean value in untreated group
+y0_sd <- 1 # primary response sd value in untreated group
+y1_mean <- 3 # primary response mean value in treated group
+y1_sd <- 1 # primary response sd value in treated group
+p <- 20 # total number of predictors
+corr = 0 # inter-predictor correlation
+n1 = 25 # treated individuals
+n0 = 25 # untreated
+p = 20 # number of genes to combine for the signature
+valid_sigma = 1.8 # this corresponds to avg U_Y = 0.9
+prop_invalid_grid = seq(0,1,0.1) # proportions of invalid surrogates in gamma to test
+n_sim = 500 # number of simulations
+
+# evaluate true surrogate strength
+# truth <- calc.truth(p = 500, prop_valid=1, valid_sigma, corr, mode = "simple")
+# mean(truth$us_true)
+
+p_evaluate_df = as.data.frame(matrix(0,nrow = n_sim, ncol = length(prop_invalid_grid)))
+colnames(p_evaluate_df) = prop_invalid_grid
+for (i in 1:length(prop_invalid_grid)){
+  for (j in 1:n_sim){
+    prop_invalid = prop_invalid_grid[i]
+    prop_valid = 1 - prop_invalid 
+    
+    data = gen.data(n1, n0, p, prop_valid, valid_sigma, corr, mode = "simple")
+    
+    # get weights from screening function
+    Y = c(data$y1,data$y0)
+    A = c(rep(1,n1), rep(0,n0))
+    X = rbind(data$s1, data$s0)
+    colnames(X) = c(1:ncol(X))
+    
+    u_y_estimated <- test.surrogate(
+      yone = data$y1, yzero = data$y0, sone = data$y1, szero = data$y0, epsilon = 0.1
+    )$u.y
+    # u_y_true = truth$uy_true
+    # choose epsilon as maximum of estimated value of UY - 0.5 and 0
+    eps <- max(0, u_y_estimated - 0.5)
+    
+    screen_res = rise_screen(Y, X, A, reference = "0", 
+                             alpha = 0.05, epsilon = eps,
+                             p_correction = "none", cores = 1)
+    
+    weights = data.frame("marker" = colnames(X),
+                         "weight" = abs(1/screen_res$results[,"delta"]))
+    res_evaluate = rise_evaluate(Y_evaluate = Y, X_evaluate = X, A_evaluate = A,
+                                 markers = colnames(X), power_desired = 0.8,
+                                 weights = weights, plot = F, alpha = 0.05)
+    
+    p_evaluate_df[j,i] = res_evaluate$evaluation_results[,"p_unadjusted"]
+    print(paste0("Prop. invalid = ", prop_invalid_grid[i],  " : Simulation ", j, " of ", n_sim, " complete."))
+  }
+}
+save(p_evaluate_df, file = "./output/simulation/metrics_figure4.Rdata")
+p_evaluate_df = get(load("./output/simulation/metrics_figure4.Rdata"))
+
+p_evaluate_long <- p_evaluate_df %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  mutate(variable = as.numeric(variable))  # Convert variable names to numeric
+
+# Create the violin plot
+fig4 = ggplot(p_evaluate_long, aes(x = as.factor(variable), y = value)) +
+  geom_boxplot(outlier.shape = NA) +
+  labs(
+    x = "Proportion of invalid surrogates",
+    y = "P-value",
+    title = expression("Evaluation stage P-values as a function of the proportion of false positives in " * gamma[S])
+  ) +
+  geom_hline(yintercept = 0.05, colour = "maroon", linetype = "longdash", linewidth = 1, alpha = 0.6) +
+  theme_minimal(base_size = 26) +
+  theme(plot.title = element_blank(),
+        plot.background = element_rect(fill = 'white', color = 'white'),
+        legend.position = "none") +
+  scale_fill_brewer(palette = "Spectral")
+
+fig4
+
+
+ggsave(plot = fig4, filename = "figure4.eps",
+       path = "./output/figures/",
+       units = "cm",
+       width = 35,
+       height = 20, dpi = 800)
+
+ggsave(plot = fig4, filename = "figure4.pdf",
+       path = "./output/figures/",
+       units = "cm",
+       width = 35,
+       height = 20, dpi = 800)
+```
+
+# Supporting Information
+
+## Figure S1
+Supplementary Figure 1: Data generation process 1, scenario 2: violin plots of empirical power (left) and false discovery proportion (right) prior to multiple testing corrections for a fixed sample size $n = 50$ and average surrogate strength $\bar{U_{S}} = 0.9$ for different values of inter-predictor correlation.
+```{r}
+alpha <- 0.05 # nominal significance level
+beta <- 0.2 # desired power for univariate surrogate test = (1-beta)*100% 
+s0_mean <- 0 # invalid surrogate mean value in untreated group
+s0_sd <- 1 # invalid surrogate sd value in untreated group
+s1_mean <- 0 # invalid surrogate mean value in treated group
+s1_sd <- 2 # invalid surrogate sd value in treated group
+y0_mean <- 0 # primary response mean value in untreated group
+y0_sd <- 1 # primary response sd value in untreated group
+y1_mean <- 3 # primary response mean value in treated group
+y1_sd <- 1 # primary response sd value in treated group
+valid_sigma <- 1.8 # set sigma such that average surrogate strength = 0.9
+n <- 50 # fixed total sample size
+n0 <- n / 2 # treated sample size 
+n1 <- n / 2 # untreated sample size 
+p = 500 # total number of predictors
+prop_valid <- 0.1 # proportion of predictors which are valid surrogates
+p_valid <- prop_valid * p # number of valid surrogates
+p_invalid = (1 - prop_valid) * p # number of invalid surrogates
+n_sim = 500 # number of simulations
+
+corr_grid = seq(0,0.5,0.1) # grid of correlation values
+metrics_figs1 = matrix(0,nrow = length(corr_grid)*n_sim, ncol = 3)
+
+for (i in 1:length(corr_grid)){
+  for (j in 1:n_sim){
+    res <- simulate_results(n1 = n / 2, 
+                            n0 = n / 2, 
+                            p = p, 
+                            prop_valid, 
+                            n_sim = 1, 
+                            valid_sigma,
+                            corr = corr_grid[i],
+                            mode = "simple")
+    
+    # Append results to data frame
+    
+    metrics_figs1[(i-1)*(n_sim) + j,1] = corr_grid[i]
+    metrics_figs1[(i-1)*(n_sim) + j,2] = res[["metrics"]][["metrics_unadjusted"]][["avg_fdr"]]
+    metrics_figs1[(i-1)*(n_sim) + j,3] = res[["metrics"]][["metrics_unadjusted"]][["avg_tpr"]]
+    
+    
+    print(paste0("Correlation : ", corr_grid[i], ", simulation ", j, " of ", n_sim, " complete." ))
+  }
+}
+
+save(metrics_figs1, file = "./output/simulation/metrics_figures1.Rdata")
+metrics_figs1 = get(load("./output/simulation/metrics_figures1.Rdata"))
+
+metrics_figs1 = data.frame("correlation" = metrics_figs1[,1], "fdr" = metrics_figs1[,2], "tpr" = metrics_figs1[,3])
+
+fdr_plot_s1 = metrics_figs1 %>% ggplot(aes(x = as.factor(correlation), y = fdr, fill = correlation)) + 
+  geom_violin() +
+  ylim(0,1) + 
+  ylab("False Discovery Proportion") +
+  xlab(expression(sigma[corr])) + 
+  ggtitle("Proportion of False Positives as a function of inter-predictor correlation") +
+  geom_hline(yintercept = 0.05, colour = "maroon", linetype = "longdash", linewidth = 1, alpha = 0.6) +
+  theme_minimal(base_size = 24) +
+  theme(plot.background = element_rect(fill = 'white', color = 'white'),
+        plot.title = element_blank(),
+        legend.position = "none",
+        axis.title.x = element_text(size = 35)) +
+  scale_fill_gradient2(low = "white", mid = "lightcoral", high = "red", midpoint = 0.25)
+
+tpr_plot_s1 = metrics_figs1 %>% ggplot(aes(x = as.factor(correlation), y = tpr, fill = correlation)) + 
+  geom_violin() +
+  ylim(0,1) + 
+  ylab("Empirical Power") +
+  xlab(expression(sigma[corr])) + 
+  ggtitle("Proportion of False Positives as a function of inter-predictor correlation") +
+  theme_minimal(base_size = 24) +
+  theme(plot.background = element_rect(fill = 'white', color = 'white'),
+        plot.title = element_blank(),
+        legend.position = "none",
+        axis.title.x = element_text(size = 35)) +
+  scale_fill_gradient2(low = "white", mid = "lightcoral", high = "red", midpoint = 0.25)
+
+figures1 = grid.arrange(
+  arrangeGrob(tpr_plot_s1, fdr_plot_s1,  
+              ncol = 2, widths = c(1, 1)))
+
+ggsave(plot = figures1,
+       "./output/figures/figureS1.eps", 
+       units = "cm", 
+       width = 35, 
+       height = 18, dpi = 800)
+
+ggsave(plot = figures1,
+       "./output/figures/figureS1.pdf", 
+       units = "cm", 
+       width = 35, 
+       height = 18, dpi = 800)
+```
+
+## Figure S2 
+Supplementary Figure 2: Data generation process 1, scenario 2: Empirical power (left) and false discovery proportion (right) prior to multiple testing corrections as a function of average surrogate strength for different multiple testing corrections (Benjamini-Hochberg, Bonferroni, Benjamini-Yekutieli, Unadjusted) for a fixed sample size $n = 50$.
+```{r}
+# Set up the values to simulate
+# Set parameters
+alpha <- 0.05 # nominal significance level
+beta <- 0.2 # desired power for univariate surrogate test = (1-beta)*100% 
+s0_mean <- 0 # invalid surrogate mean value in untreated group
+s0_sd <- 1 # invalid surrogate  sd value in untreated group
+s1_mean <- 0 # invalid surrogate mean value in treated group
+s1_sd <- 1 # invalid surrogate sd value in treated group
+y0_mean <- 0 # primary response mean value in untreated group
+y0_sd <- 1 # primary response sd value in untreated group
+y1_mean <- 3 # primary response mean value in treated group
+y1_sd <- 1 # primary response sd value in treated group
+n <- 50 # total sample size
+n0 <- n / 2 # treated sample size 
+n1 <- n / 2 # untreated sample size 
+p = 500 # total number of predictors
+prop_valid <- 0.1 # proportion of predictors which are valid surrogates
+p_valid <- prop_valid * p # number of valid surrogates
+p_invalid = (1 - prop_valid) * p # number of invalid surrogates
+n_sim = 500 # number of simulations
+corr = 0 # correlation - off-diagonal element in surrogate covariance matrix
+sigma_grid = c(0.01,0.65,1.8,3,5.5,9,15,30,68,244) # values of sigma
+
+# Initialise an empty list for p-values and dataframe for metrics
+p_values = list()
+metrics_figs2 <- data.frame(
+  n = integer(), 
+  p = integer(), 
+  sigma_S = numeric(),
+  avg_us = numeric(),
+  avg_fpr_unadjusted = numeric(),
+  avg_fdr_unadjusted = numeric(),
+  avg_tpr_unadjusted = numeric(),
+  avg_ppv_unadjusted = numeric(),
+  avg_fpr_bonf = numeric(),
+  avg_fdr_bonf = numeric(),
+  avg_tpr_bonf = numeric(),
+  avg_ppv_bonf = numeric(),
+  avg_fpr_bh = numeric(),
+  avg_fdr_bh = numeric(),
+  avg_tpr_bh = numeric(),
+  avg_ppv_bh = numeric(),
+  avg_fpr_by = numeric(),
+  avg_fdr_by = numeric(),
+  avg_tpr_by = numeric(),
+  avg_ppv_by = numeric()
+)
+
+# Perform simulations over grid
+for (sigma in sigma_grid){
+  avg_us = round(mean(calc.truth(p, prop_valid, valid_sigma = sigma, corr, mode = "simple")$us_true),2)
+  res <- simulate_results(n1 = n / 2, 
+                          n0 = n / 2, 
+                          p = p, 
+                          prop_valid, 
+                          n_sim = n_sim, 
+                          valid_sigma = sigma, 
+                          corr = corr, 
+                          mode = "simple")
+  
+  # p_values = append(p_values,list(res[["p_values"]][["p_unadjusted"]]))
+  
+  # Append results to data frame
+  metrics_figs2 <- rbind(metrics_figs2, data.frame(
+    n = n, p = p,
+    sigma_S = sigma,
+    avg_us = avg_us,
+    avg_fpr_unadjusted = res[["metrics"]][["metrics_unadjusted"]][["avg_fpr"]], 
+    avg_fdr_unadjusted = res[["metrics"]][["metrics_unadjusted"]][["avg_fdr"]], 
+    avg_tpr_unadjusted = res[["metrics"]][["metrics_unadjusted"]][["avg_tpr"]],
+    avg_ppv_unadjusted = res[["metrics"]][["metrics_unadjusted"]][["avg_ppv"]],
+    avg_fpr_bonf = res[["metrics"]][["metrics_bonf"]][["avg_fpr"]], 
+    avg_fdr_bonf = res[["metrics"]][["metrics_bonf"]][["avg_fdr"]], 
+    avg_tpr_bonf = res[["metrics"]][["metrics_bonf"]][["avg_tpr"]],
+    avg_ppv_bonf = res[["metrics"]][["metrics_bonf"]][["avg_ppv"]],
+    avg_fpr_bh = res[["metrics"]][["metrics_bh"]][["avg_fpr"]], 
+    avg_fdr_bh = res[["metrics"]][["metrics_bh"]][["avg_fdr"]], 
+    avg_tpr_bh = res[["metrics"]][["metrics_bh"]][["avg_tpr"]],
+    avg_ppv_bh = res[["metrics"]][["metrics_bh"]][["avg_ppv"]],
+    avg_fpr_by = res[["metrics"]][["metrics_by"]][["avg_fpr"]], 
+    avg_fdr_by = res[["metrics"]][["metrics_by"]][["avg_fdr"]], 
+    avg_tpr_by = res[["metrics"]][["metrics_by"]][["avg_tpr"]],
+    avg_ppv_by = res[["metrics"]][["metrics_by"]][["avg_ppv"]]
+  ))
+  print(paste0("Simulation ", which(sigma_grid == sigma), " of ", length(sigma_grid), " complete."))
+}
+
+save(metrics_figs2, file = "./output/simulation/metrics_figures2.Rdata")
+
+metrics_figs2 = get(load("./output/simulation/metrics_figures2.Rdata"))
+
+# Pivot metrics to long format 
+metrics_figs2_fdr_long <- metrics_figs2  %>%
+  pivot_longer(cols = c(avg_fdr_unadjusted, 
+                        avg_fdr_bonf, 
+                        avg_fdr_bh, 
+                        avg_fdr_by), 
+               names_to = "Correction", 
+               values_to = "Value") %>% 
+  dplyr::select(avg_us, Correction, Value)
+
+metrics_figs2_tpr_long <- metrics_figs2  %>%
+  pivot_longer(cols = c(avg_tpr_unadjusted, 
+                        avg_tpr_bonf, 
+                        avg_tpr_bh, 
+                        avg_tpr_by), 
+               names_to = "Correction", 
+               values_to = "Value") %>% 
+  dplyr::select(avg_us, Correction, Value)
+
+# Plot
+FDR_figs2 = ggplot(metrics_figs2_fdr_long, aes(x = avg_us, y = Value, linetype = Correction, color = Correction)) +
+  geom_line(size = 1.3) +
+  scale_color_brewer(palette = "Set1") +
+  labs(x = expression(bar(U[S])), y = "False Discovery Proportion", linetype = "Correction") +
+  scale_linetype_manual(values = c("avg_fdr_unadjusted" = "solid", 
+                                   "avg_fdr_bonf" = "dashed",
+                                   "avg_fdr_bh" = "dotted",
+                                   "avg_fdr_by" = "dotdash"),
+                        labels = c("avg_fdr_unadjusted" = "Unadjusted", 
+                                   "avg_fdr_bonf" = "Bonferroni",
+                                   "avg_fdr_bh" = "B-H",
+                                   "avg_fdr_by" = "B-Y")) +
+  scale_color_manual(values = c("avg_fdr_unadjusted" = brewer.pal(n = 4, name = "Set1")[1], 
+                                "avg_fdr_bonf" = brewer.pal(n = 4, name = "Set1")[2],
+                                "avg_fdr_bh" = brewer.pal(n = 4, name = "Set1")[3],
+                                "avg_fdr_by" = brewer.pal(n = 4, name = "Set1")[4]),
+                     labels = c("avg_fdr_unadjusted" = "Unadjusted", 
+                                "avg_fdr_bonf" = "Bonferroni",
+                                "avg_fdr_bh" = "B-H",
+                                "avg_fdr_by" = "B-Y")) + 
+  theme_minimal(base_size = 24) +
+  geom_hline(yintercept = 0.05, colour = "maroon", linetype = "longdash", linewidth = 1, alpha = 0.6) +
+  theme(plot.title = element_blank(),
+        plot.background = element_rect(fill = 'white', color = 'white'))
+
+TPR_figs2 = ggplot(metrics_figs2_tpr_long, aes(x = avg_us, y = Value, linetype = Correction, color = Correction)) +
+  geom_line(size = 1.3) +
+  scale_color_brewer(palette = "Set1") +
+  labs(x = expression(bar(U[S])), y = "Empirical Power", linetype = "Correction") +
+  scale_linetype_manual(values = c("avg_tpr_unadjusted" = "solid", 
+                                   "avg_tpr_bonf" = "dashed",
+                                   "avg_tpr_bh" = "dotted",
+                                   "avg_tpr_by" = "dotdash"),
+                        labels = c("avg_tpr_unadjusted" = "Unadjusted", 
+                                   "avg_tpr_bonf" = "Bonferroni",
+                                   "avg_tpr_bh" = "B-H",
+                                   "avg_tpr_by" = "B-Y")) +
+  scale_color_manual(values = c("avg_tpr_unadjusted" = brewer.pal(n = 4, name = "Set1")[1], 
+                                "avg_tpr_bonf" = brewer.pal(n = 4, name = "Set1")[2],
+                                "avg_tpr_bh" = brewer.pal(n = 4, name = "Set1")[3],
+                                "avg_tpr_by" = brewer.pal(n = 4, name = "Set1")[4]),
+                     labels = c("avg_tpr_unadjusted" = "Unadjusted", 
+                                "avg_tpr_bonf" = "Bonferroni",
+                                "avg_tpr_bh" = "B-H",
+                                "avg_tpr_by" = "B-Y")) + 
+  theme_minimal(base_size = 24) +
+  theme(plot.title = element_blank(),
+        plot.background = element_rect(fill = 'white', color = 'white'))
+
+## FPR and TPR in the same grid
+TPR_patchwork_figs2 = TPR_figs2  + 
+  ylim(0,1) + 
+  theme(legend.position = "none",
+        plot.title = element_blank())
+
+FDR_patchwork_figs2 = FDR_figs2  + 
+  ylim(0,1) + 
+  theme(legend.position = "none",
+        plot.title = element_blank())
+
+legend = get_legend(ggplot(metrics_figs2_tpr_long, aes(x = avg_us, y = Value, linetype = Correction, color = Correction)) +
+                      geom_line(size = 1.3) +
+                      scale_color_brewer(palette = "Set1") +
+                      labs(x = expression(bar(U[S])), y = "False Discovery Proportion", linetype = "Correction") +
+                      scale_linetype_manual(values = c("avg_tpr_unadjusted" = "solid", 
+                                                       "avg_tpr_bonf" = "dashed",
+                                                       "avg_tpr_bh" = "dotted",
+                                                       "avg_tpr_by" = "dotdash"),
+                                            labels = c("avg_tpr_unadjusted" = "Unadjusted", 
+                                                       "avg_tpr_bonf" = "Bonferroni",
+                                                       "avg_tpr_bh" = "B-H",
+                                                       "avg_tpr_by" = "B-Y")) +
+                      scale_color_manual(values = c("avg_tpr_unadjusted" = brewer.pal(n = 4, name = "Set1")[1], 
+                                                    "avg_tpr_bonf" = brewer.pal(n = 4, name = "Set1")[2],
+                                                    "avg_tpr_bh" = brewer.pal(n = 4, name = "Set1")[3],
+                                                    "avg_tpr_by" = brewer.pal(n = 4, name = "Set1")[4]),
+                                         labels = c("avg_tpr_unadjusted" = "Unadjusted", 
+                                                    "avg_tpr_bonf" = "Bonferroni",
+                                                    "avg_tpr_bh" = "B-H",
+                                                    "avg_tpr_by" = "B-Y")) + 
+                      theme_minimal(base_size = 20) +
+                      theme(plot.background = element_rect(fill = 'white', color = 'white'),
+                            legend.key.width = unit(2, "cm")))
+
+figures2 = grid.arrange(
+  arrangeGrob(TPR_patchwork_figs2, FDR_patchwork_figs2, legend, 
+              ncol = 3, widths = c(1, 1, 0.3)))  # Adjust fontsize and fontface
+
+
+figures2
+
+ggsave(plot = figures2,
+       "./output/figures/figureS2.eps", 
+       units = "cm", 
+       width = 41, 
+       height = 18, dpi = 800)
+
+ggsave(plot = figures2,
+       "./output/figures/figureS2.pdf", 
+       units = "cm", 
+       width = 41, 
+       height = 18, dpi = 800)
+```
+
+## Figure S3
+Supplementary Figure 3: Data generation process 2, scenario 1: boxplots of observed false positive rates against different sample sizes in the uncorrelated setting. The nominal significance level $\alpha = 0.05$ is plotted as a dashed red line.
+```{r}
+# Set parameters
+alpha <- 0.05 # nominal significance level
+beta <- 0.2 # desired power for univariate surrogate test = (1-beta)*100% 
+s0_mean <- 0 # invalid surrogate mean value in untreated group
+s0_sd <- 1 # invalid surrogate sd value in untreated group
+s1_mean <- 0 # invalid surrogate mean value in treated group
+s1_sd <- 2 # invalid surrogate sd value in treated group
+y0_mean <- 0 # primary response mean value in untreated group
+y0_sd <- 1 # primary response sd value in untreated group
+y1_mean <- 3 # primary response mean value in treated group
+y1_sd <- 1 # primary response sd value in treated group
+p <- 500 # total number of predictors
+prop_valid <- 0 # proportion of predictors which are valid surrogates
+p_valid <- prop_valid * p # number of valid surrogates
+p_invalid = (1 - prop_valid) * p # number of invalid surrogates
+n_sim = 500 # number of simulations
+corr = 0
+
+n_grid = seq(10,100,10)
+
+metrics_figs3 = matrix(0,nrow = length(n_grid)*n_sim, ncol = 2)
+
+for (i in 1:length(n_grid)){
+  for (j in 1:n_sim){
+    res <- simulate_results(n1 = n_grid[i] / 2, 
+                            n0 = n_grid[i] / 2, 
+                            p = p, 
+                            prop_valid = 0, 
+                            n_sim = 1, 
+                            valid_sigma,
+                            corr = 0, 
+                            mode = "complex")
+    
+    metrics_figs3[(i-1)*(n_sim) + j,1] = n_grid[i]
+    metrics_figs3[(i-1)*(n_sim) + j,2] = res[["metrics"]][["metrics_unadjusted"]][["avg_fpr"]]
+    print(paste0("Sample size : ", n_grid[i], ", simulation ", j, " of ", n_sim, " complete." ))
+  }
+}
+
+metrics_figs3 = data.frame("n" = metrics_figs3[,1],
+                           "False Positive Rate" = metrics_figs3[,2])
+
+save(metrics_figs3, file = "./output/simulation/metrics_figures3.Rdata")
+
+metrics_figs3 = get(load("./output/simulation/metrics_figures3.Rdata"))
+figs3 = metrics_figs3 %>% ggplot(aes(x = as.factor(n), 
+                                     y = FPR)) +
+  geom_boxplot() +
+  labs(title = "Observed FPR across different sample sizes - DGF 2",
+       x = "Sample size",
+       y = "False Positive Rate",
+       fill = "Sample Size") + 
+  ylim(0,0.15) +
+  geom_hline(yintercept = 0.05, colour = "maroon", linetype = "longdash", linewidth = 1, alpha = 0.6) +
+  theme_minimal(base_size = 35) +
+  theme(plot.title = element_blank(),
+        plot.background = element_rect(fill = 'white', color = 'white'),
+        legend.position = "none") +
+  scale_fill_brewer(palette = "RdYlGn")
+
+figs3
+
+ggsave(plot = figs3,
+       "./output/figures/figureS3.eps", 
+       units = "cm", 
+       width = 40, 
+       height = 25, dpi = 800)
+
+ggsave(plot = figs3,
+       "./output/figures/figureS3.pdf", 
+       units = "cm", 
+       width = 40, 
+       height = 25, dpi = 800)
+```
+
+## Figure S4
+Supplementary Figure 4: Data generation process 2, scenario 1: violin plots of observed false positive rates against different levels of correlation prior to multiple testing corrections across 500 simulations for a fixed sample size of $n = 50$. The nominal significance level $\alpha = 0.05$ is plotted as a dashed red line.
+```{r}
+# Set parameters
+alpha <- 0.05 # nominal significance level
+beta <- 0.2 # desired power for univariate surrogate test = (1-beta)*100% 
+s0_mean <- 0 # invalid surrogate mean value in untreated group
+s0_sd <- 1 # invalid surrogate sd value in untreated group
+s1_mean <- 0 # invalid surrogate mean value in treated group
+s1_sd <- 2 # invalid surrogate sd value in treated group
+y0_mean <- 0 # primary response mean value in untreated group
+y0_sd <- 1 # primary response sd value in untreated group
+y1_mean <- 3 # primary response mean value in treated group
+y1_sd <- 1 # primary response sd value in treated group
+n <- 50 # total sample size
+n0 <- n / 2 # treated sample size 
+n1 <- n / 2 # untreated sample size 
+p = 500 # total number of predictors
+prop_valid <- 0 # proportion of predictors which are valid surrogates
+p_valid <- prop_valid * p # number of valid surrogates
+p_invalid = (1 - prop_valid) * p # number of invalid surrogates
+n_sim = 500 # number of simulations
+
+corr_grid = seq(0,0.5,0.1)
+
+metrics_figs4 = matrix(0,nrow = length(corr_grid)*n_sim, ncol = 2)
+
+for (i in 1:length(corr_grid)){
+  for (j in 1:n_sim){
+    res <- simulate_results(n1 = n / 2, 
+                            n0 = n / 2, 
+                            p = p, 
+                            prop_valid = 0, 
+                            n_sim = 1, 
+                            corr = corr_grid[i], 
+                            mode = "complex")
+    
+    # p_values = append(p_values,list(res[["p_values"]][["p_unadjusted"]]))
+    
+    # Append results to data frame
+    
+    metrics_figs4[(i-1)*(n_sim) + j,1] = corr_grid[i]
+    metrics_figs4[(i-1)*(n_sim) + j,2] = res[["metrics"]][["metrics_unadjusted"]][["avg_fpr"]]
+    print(paste0("Correlation : ", corr_grid[i], ", simulation ", j, " of ", n_sim, " complete." ))
+  }
+}
+
+metrics_figs4 = data.frame("correlation" = metrics_figs4[,1],
+                           "False Positive Rate" = metrics_figs4[,2])
+
+save(metrics_figs4, file = "./output/simulation/metrics_figures4.Rdata")
+
+metrics_figs4 = get(load("./output/simulation/metrics_figures4.Rdata"))
+
+figs4 = metrics_figs4 %>% ggplot(aes(x = as.factor(correlation), 
+                                     y = FPR,
+                                     fill = correlation)) +
+  geom_violin() +
+  labs(title = "Observed FPR across different inter-predictor correlation levels - DGF 2",
+       x = expression(sigma[corr]),
+       y = "False Positive Rate",
+       fill = "Correlation") + 
+  geom_hline(yintercept = 0.05, colour = "maroon", linetype = "longdash", linewidth = 1, alpha = 0.6) +
+  theme_minimal(base_size = 35) +
+  theme(plot.title = element_blank(),
+        plot.background = element_rect(fill = 'white', color = 'white'),
+        legend.position = "none",
+        axis.title.x = element_text(size = 55)) +
+  scale_fill_gradient2(low = "white", mid = "lightcoral", high = "red", midpoint = 0.25)
+
+figs4
+
+ggsave(plot = figs4,
+       "./output/figures/figureS4.eps", 
+       units = "cm", 
+       width = 40, 
+       height = 20, dpi = 800)
+
+ggsave(plot = figs4,
+       "./output/figures/figureS4.pdf", 
+       units = "cm", 
+       width = 40, 
+       height = 20, dpi = 800)
+```
+
+## Figure S5
+Supplementary Figure 5: Data generation process 2, scenario 2: empirical power (left) and false discovery proportion (right) prior to multiple testing corrections as a function of average surrogate strength for three different sample sizes.
+```{r}
+# round(mean(calc.truth(p = 500, prop_valid = 0.1, valid_sigma = 40000, corr, mode = "complex")$us_true),2) # 0.55
+# round(mean(calc.truth(p = 500, prop_valid = 0.1, valid_sigma = 9000, corr, mode = "complex")$us_true),2) # 0.6
+# round(mean(calc.truth(p = 500, prop_valid = 0.1, valid_sigma = 4000, corr, mode = "complex")$us_true),2) # 0.65
+# round(mean(calc.truth(p = 500, prop_valid = 0.1, valid_sigma = 1600, corr, mode = "complex")$us_true),2) # 0.7
+# round(mean(calc.truth(p = 500, prop_valid = 0.1, valid_sigma = 850, corr, mode = "complex")$us_true),2) # 0.75
+# round(mean(calc.truth(p = 500, prop_valid = 0.1, valid_sigma = 400, corr, mode = "complex")$us_true),2) # 0.8
+# round(mean(calc.truth(p = 500, prop_valid = 0.1, valid_sigma = 210, corr, mode = "complex")$us_true),2) # 0.85
+# round(mean(calc.truth(p = 500, prop_valid = 0.1, valid_sigma = 80, corr, mode = "complex")$us_true),2) # 0.9
+# round(mean(calc.truth(p = 500, prop_valid = 0.1, valid_sigma = 15, corr, mode = "complex")$us_true),2) # 0.95
+# round(mean(calc.truth(p = 500, prop_valid = 0.1, valid_sigma = 0.0001, corr, mode = "complex")$us_true),3) # 0.985
+
+# Set up the values to simulate
+alpha <- 0.05 # nominal significance level
+beta <- 0.2 # desired power for univariate surrogate test = (1-beta)*100% 
+s0_mean <- 0 # invalid surrogate mean value in untreated group
+s0_sd <- 1 # invalid surrogate sd value in untreated group
+s1_mean <- 0 # invalid surrogate mean value in treated group
+s1_sd <- 2 # invalid surrogate sd value in treated group
+y0_mean <- 0 # primary response mean value in untreated group
+y0_sd <- 1 # primary response sd value in untreated group
+y1_mean <- 3 # primary response mean value in treated group
+y1_sd <- 1 # primary response sd value in treated group
+p = 500 # total number of predictors
+sigma_grid = c(0.0001,15,80,210,400,850,1600,4000,9000,40000) # values of sigma
+n_grid <- c(30,50,100) # 3 sample sizes
+n_sim = 500
+prop_valid = 0.1
+corr = 0
+
+# Initialise an empty list for p-values and dataframe for metrics
+p_values = list()
+metrics_figs5 <- data.frame(
+  n = integer(), 
+  p = integer(), 
+  sigma_S = numeric(),
+  avg_us = numeric(),
+  avg_fpr_unadjusted = numeric(),
+  avg_fdr_unadjusted = numeric(),
+  avg_tpr_unadjusted = numeric(),
+  avg_ppv_unadjusted = numeric(),
+  avg_fpr_bonf = numeric(),
+  avg_fdr_bonf = numeric(),
+  avg_tpr_bonf = numeric(),
+  avg_ppv_bonf = numeric(),
+  avg_fpr_bh = numeric(),
+  avg_fdr_bh = numeric(),
+  avg_tpr_bh = numeric(),
+  avg_ppv_bh = numeric(),
+  avg_fpr_by = numeric(),
+  avg_fdr_by = numeric(),
+  avg_tpr_by = numeric(),
+  avg_ppv_by = numeric()
+)
+
+# Perform simulations over grid
+for (sigma in sigma_grid){
+  avg_us = round(mean(calc.truth(p, prop_valid, valid_sigma = sigma, corr, mode = "complex")$us_true),2)
+  for (n in n_grid) {
+    res <- simulate_results(n1 = n / 2, 
+                            n0 = n / 2, 
+                            p = p, 
+                            prop_valid, 
+                            n_sim = n_sim, 
+                            valid_sigma = sigma,
+                            corr = 0, 
+                            mode = "complex")
+    
+    # p_values = append(p_values,list(res[["p_values"]][["p_unadjusted"]]))
+    
+    # Append results to data frame
+    metrics_figs5 <- rbind(metrics_figs5, data.frame(
+      n = n, p = p,
+      sigma_S = sigma,
+      avg_us = avg_us,
+      avg_fpr_unadjusted = res[["metrics"]][["metrics_unadjusted"]][["avg_fpr"]], 
+      avg_fdr_unadjusted = res[["metrics"]][["metrics_unadjusted"]][["avg_fdr"]], 
+      avg_tpr_unadjusted = res[["metrics"]][["metrics_unadjusted"]][["avg_tpr"]],
+      avg_ppv_unadjusted = res[["metrics"]][["metrics_unadjusted"]][["avg_ppv"]],
+      avg_fpr_bonf = res[["metrics"]][["metrics_bonf"]][["avg_fpr"]], 
+      avg_fdr_bonf = res[["metrics"]][["metrics_bonf"]][["avg_fdr"]], 
+      avg_tpr_bonf = res[["metrics"]][["metrics_bonf"]][["avg_tpr"]],
+      avg_ppv_bonf = res[["metrics"]][["metrics_bonf"]][["avg_ppv"]],
+      avg_fpr_bh = res[["metrics"]][["metrics_bh"]][["avg_fpr"]], 
+      avg_fdr_bh = res[["metrics"]][["metrics_bh"]][["avg_fdr"]], 
+      avg_tpr_bh = res[["metrics"]][["metrics_bh"]][["avg_tpr"]],
+      avg_ppv_bh = res[["metrics"]][["metrics_bh"]][["avg_ppv"]],
+      avg_fpr_by = res[["metrics"]][["metrics_by"]][["avg_fpr"]], 
+      avg_fdr_by = res[["metrics"]][["metrics_by"]][["avg_fdr"]], 
+      avg_tpr_by = res[["metrics"]][["metrics_by"]][["avg_tpr"]],
+      avg_ppv_by = res[["metrics"]][["metrics_by"]][["avg_ppv"]]
+    ))
+    print(paste0("Sigma = ", sigma, ", n = ", n, " complete."))
+  }
+}
+
+save(metrics_figs5, file = "./output/simulation/metrics_figures5.Rdata")
+
+metrics_figs5 = get(load("./output/simulation/metrics_figures5.Rdata"))
+
+# FDR as a function of surrogate strength
+FDR_plot_unadjusted = metrics_figs5 %>% ggplot(aes(x = avg_us, y = avg_fdr_unadjusted, color = as.factor(n), linetype = as.factor(n))) + 
+  geom_line(size = 1.3) + 
+  geom_point() +
+  ylab("False Discovery Proportion") +
+  xlab(expression(bar(U[S]))) +
+  geom_hline(yintercept = 0.05, colour = "maroon", linetype = "longdash", linewidth = 1, alpha = 0.6) +
+  scale_color_brewer(palette = "Set1") + 
+  guides(color = guide_legend(title = "Sample size")) +
+  ggtitle("Proportion of False Positives as a function of average surrogate strength - unadjusted p-values") +
+  theme_minimal(base_size = 24) +
+  theme(plot.background = element_rect(fill = 'white', color = 'white'),
+        plot.title = element_blank()) 
+
+TPR_plot_unadjusted  = metrics_figs5 %>% ggplot(aes(x = avg_us, y = avg_tpr_unadjusted , color = as.factor(n), linetype = as.factor(n))) + 
+  geom_line(size = 1.3) + 
+  geom_point() +
+  ylab("Empirical power") +
+  xlab(expression(bar(U[S]))) +
+  scale_color_brewer(palette = "Set1") + 
+  guides(color = guide_legend(title = "Sample size")) +
+  ggtitle("Empirical power as a function of average surrogate strength - unadjusted p-values") +
+  theme_minimal(base_size = 24) +
+  theme(plot.background = element_rect(fill = 'white', color = 'white'),
+        plot.title = element_blank()) 
+
+## FPR and TPR in the same grid 
+TPR_patchwork = TPR_plot_unadjusted + 
+  ylim(0,1) + 
+  theme(legend.position = "none")
+
+FDR_patchwork = FDR_plot_unadjusted + 
+  ylim(0,1) + 
+  theme(legend.position = "none")
+
+# Extract the legend
+legend <- get_legend(
+  metrics_figs5 %>% 
+    ggplot(aes(x = avg_us, 
+               y = avg_fdr_unadjusted, 
+               color = as.factor(n), 
+               linetype = as.factor(n))) + 
+    geom_line(size = 1.3) + # Adjust the line size in the plot
+    geom_point() +
+    ylab("False Discovery Proportion") +
+    xlab(expression(bar(U[S]))) +
+    scale_color_brewer(palette = "Set1") + 
+    guides(
+      color = guide_legend(title = "Sample size"),
+      linetype = guide_legend(
+        title = "Sample size",
+        override.aes = list(size = 1) # Adjust line size in legend
+      )
+    ) +
+    ggtitle("Proportion of False Positives as a function of average surrogate strength - unadjusted p-values") +
+    theme_minimal(base_size = 20) +
+    theme(
+      legend.key.width = unit(2, "cm") # Increase legend key width
+    )
+)
+
+figures5 = grid.arrange(
+  arrangeGrob(TPR_patchwork, FDR_patchwork, legend, 
+              ncol = 3, widths = c(1, 1, 0.3)),  # Adjust widths as needed
+  top = textGrob("",
+                 gp = gpar(fontsize = 20))  # Adjust fontsize and fontface
+)
+
+ggsave(plot = figures5,
+       "./output/figures/figureS5.eps", 
+       units = "cm", 
+       width = 35, 
+       height = 18, dpi = 800)
+
+ggsave(plot = figures5,
+       "./output/figures/figureS5.pdf", 
+       units = "cm", 
+       width = 35, 
+       height = 18, dpi = 800)
+```
+
+## Figure S6 
+Supplementary Figure 6: Data generation process 2: The distributions of the p-values in the evaluation step are examined as a function of the false discovery proportion which make up $\widehat{\gamma}_{\mathcal{S}}$, which consists of a combination of $20$ predictors. The sample size is $n = 50$ and the valid surrogate strength is $\widehat{U_{S_{j}}} = 0.9$. The nominal significance level $\alpha = 0.05$ is plotted as a dashed red line. Desired power for the new surrogate was fixed at $80\%$.
+```{r}
+# Step 1 : construct a marker as a combination of true and false positives
+# Keep true positives strong on average : U_Y = 0.9
+source("./R/rise_evaluate.R")
+source("./R/rise_screen.R")
+alpha <- 0.05 # nominal significance level
+beta <- 0.2 # desired power for univariate surrogate test = (1-beta)*100% 
+s0_mean <- 0 # invalid surrogate mean value in untreated group
+s0_sd <- 1 # invalid surrogate sd value in untreated group
+s1_mean <- 0 # invalid surrogate mean value in treated group
+s1_sd <- 2 # invalid surrogate sd value in treated group
+y0_mean <- 0 # primary response mean value in untreated group
+y0_sd <- 1 # primary response sd value in untreated group
+y1_mean <- 3 # primary response mean value in treated group
+y1_sd <- 1 # primary response sd value in treated group
+p <- 20 # total number of predictors
+corr = 0 # inter-predictor correlation
+n1 = 25 # treated individuals
+n0 = 25 # untreated
+p = 20 # number of genes to combine for the signature
+valid_sigma = 80 # this corresponds to avg U_Y = 0.9
+prop_invalid_grid = seq(0,1,0.1) # proportions of invalid surrogates in gamma to test
+n_sim = 500 # number of simulations
+
+# evaluate true surrogate strength
+# truth <- calc.truth(p = 500, prop_valid=1, valid_sigma = 80, corr, mode = "complex")
+# round(mean(truth$us_true),2)
+
+p_evaluate_df = as.data.frame(matrix(0,nrow = n_sim, ncol = length(prop_invalid_grid)))
+colnames(p_evaluate_df) = prop_invalid_grid
+for (i in 1:length(prop_invalid_grid)){
+  for (j in 1:n_sim){
+    prop_invalid = prop_invalid_grid[i]
+    prop_valid = 1 - prop_invalid 
+    
+    data = gen.data(n1, n0, p, prop_valid, valid_sigma, corr, mode = "complex")
+    
+    # get weights from screening function
+    Y = c(data$y1,data$y0)
+    A = c(rep(1,n1), rep(0,n0))
+    X = rbind(data$s1, data$s0)
+    colnames(X) = c(1:ncol(X))
+    
+    u_y_estimated <- test.surrogate(
+      yone = data$y1, yzero = data$y0, sone = data$y1, szero = data$y0, epsilon = 0.1
+    )$u.y
+    # u_y_true = truth$uy_true
+    # choose epsilon as maximum of estimated value of UY - 0.5 and 0
+    eps <- max(0, u_y_estimated - 0.5)
+    
+    screen_res = rise_screen(Y, X, A, reference = "0", 
+                             alpha = 0.05, epsilon = eps,
+                             p_correction = "none", cores = 1)
+    
+    weights = data.frame("marker" = colnames(X),
+                         "weight" = abs(1/screen_res$results[,"delta"]))
+    res_evaluate = rise_evaluate(Y_evaluate = Y, X_evaluate = X, A_evaluate = A,
+                                 markers = colnames(X), power_desired = 0.8,
+                                 weights = weights, plot = F, alpha = 0.05)
+    
+    p_evaluate_df[j,i] = res_evaluate$evaluation_results[,"p_unadjusted"]
+    print(paste0("Prop. invalid = ", prop_invalid_grid[i],  " : Simulation ", j, " of ", n_sim, " complete."))
+  }
+}
+save(p_evaluate_df, file = "./output/simulation/metrics_figures6s.Rdata")
+p_evaluate_df = get(load("./output/simulation/metrics_figures6s.Rdata"))
+
+p_evaluate_long <- p_evaluate_df %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  mutate(variable = as.numeric(variable))  # Convert variable names to numeric
+
+# Create the violin plot
+figs6 = ggplot(p_evaluate_long, aes(x = as.factor(variable), y = value)) +
+  geom_boxplot(outlier.shape = NA) +
+  labs(
+    x = "Proportion of invalid surrogates",
+    y = "P-value",
+    title = expression("Evaluation stage P-values as a function of the proportion of false positives in " * gamma[S])
+  ) +
+  geom_hline(yintercept = 0.05, colour = "maroon", linetype = "longdash", linewidth = 1, alpha = 0.6) +
+  theme_minimal(base_size = 26) +
+  theme(plot.title = element_blank(),
+        plot.background = element_rect(fill = 'white', color = 'white'),
+        legend.position = "none") +
+  scale_fill_brewer(palette = "Spectral")
+
+figs6
+
+
+ggsave(plot = figs6, filename = "figureS6.eps",
+       path = "./output/figures/",
+       units = "cm",
+       width = 35,
+       height = 20, dpi = 800)
+
+ggsave(plot = figs6, filename = "figureS6.pdf",
+       path = "./output/figures/",
+       units = "cm",
+       width = 35,
+       height = 20, dpi = 800)
+```
+
+## Figure S7 
+Supplementary Figure 7: Data generation process 1: distribution of raw p-values under the null hypothesis. The sample size is $n = 50$, the predictors were generated without correlation, and the histogram represents the results across 1000 simulations.
+
+```{r}
+alpha <- 0.05 # nominal significance level
+beta <- 0.2 # desired power for univariate surrogate test = (1-beta)*100% 
+s0_mean <- 0 # invalid surrogate mean value in untreated group
+s0_sd <- 1 # invalid surrogate  sd value in untreated group
+s7_mean <- 0 # invalid surrogate mean value in treated group
+s7_sd <- 1 # invalid surrogate sd value in treated group
+y0_mean <- 0 # primary response mean value in untreated group
+y0_sd <- 1 # primary response sd value in untreated group
+y1_mean <- 3 # primary response mean value in treated group
+y1_sd <- 1 # primary response sd value in treated group
+n <- 50 # total sample size
+n0 <- n / 2 # treated sample size 
+n1 <- n / 2 # untreated sample size 
+p <- 500 # total number of predictors
+prop_valid <- 0 # proportion of predictors which are valid surrogates
+p_valid <- prop_valid * p # number of valid surrogates
+p_invalid = (1 - prop_valid) * p # number of invalid surrogates
+n_sim = 1000 # number of simulations
+corr = 0 # correlation - off-diagonal element in surrogate covariance matrix
+
+p_figs7 = matrix(0)
+
+for (j in 1:n_sim){
+  res <- simulate_results(n1 = n / 2, 
+                          n0 = n / 2, 
+                          p = p, 
+                          prop_valid = 0, 
+                          n_sim = 1, 
+                          corr = corr, 
+                          mode = "simple")
+  # Append p-values to results 
+  p_figs7 = append(p_figs7,res[["p_values"]][["p_unadjusted"]][1,] %>% as.matrix())
+  
+  print(paste0("simulation ", j, " of ", n_sim, " complete." ))
+}
+
+metrics_figures7 =  data.frame("p" = p_figs7[-1])
+
+save(p_figs7, file = "./output/simulation/metrics_figures7.Rdata")
+metrics_figures7 = get(load("./output/simulation/metrics_figures7.Rdata"))
+
+fig_s7 = metrics_figures7 %>% ggplot(aes(x = p)) +
+  geom_histogram(binwidth = 0.03, fill = "lightblue", color = "black", aes(y = ..density..)) +
+  labs(title = "Distribution of P-values under the null hypothesis", x = "P-value", y = "Density") +
+  xlim(0,1) +
+  theme_minimal(base_size = 20) +
+  theme(plot.title = element_blank(),
+        plot.background = element_rect(fill = 'white', color = 'white'))
+
+fig_s7
+
+ggsave(plot = fig_s7,
+       "./output/figures/figureS7.eps", 
+       units = "cm", 
+       width = 25, 
+       height = 7, dpi = 800)
+
+ggsave(plot = fig_s7,
+       "./output/figures/figureS7.pdf", 
+       units = "cm", 
+       width = 25, 
+       height = 7, dpi = 800)
+```
+
+## Figure S8
+### a
+Data generation process 1: the distributions of the p-values in the evaluation step are examined as a function of the false discovery proportion which make up $\widehat{\gamma}_{\mathcal{S}}$, which consists of a combination of $100$ predictors. The sample size is $n = 50$ and the valid surrogate strength is $\widehat{U_{S_{j}}} = 0.9$. The nominal significance level $\alpha = 0.05$ is plotted as a dashed red line. Desired power for the new surrogate was fixed at $80\%$. 
+```{r}
+# Step 1 : construct a marker as a combination of true and false positives
+# Keep true positives strong on average : U_Y = 0.9
+source("./R/rise_evaluate.R")
+source("./R/rise_screen.R")
+alpha <- 0.05 # nominal significance level
+beta <- 0.2 # desired power for univariate surrogate test = (1-beta)*100% 
+s0_mean <- 0 # invalid surrogate mean value in untreated group
+s0_sd <- 1 # invalid surrogate sd value in untreated group
+s1_mean <- 0 # invalid surrogate mean value in treated group
+s1_sd <- 2 # invalid surrogate sd value in treated group
+y0_mean <- 0 # primary response mean value in untreated group
+y0_sd <- 1 # primary response sd value in untreated group
+y1_mean <- 3 # primary response mean value in treated group
+y1_sd <- 1 # primary response sd value in treated group
+p <- 100 # total number of predictors
+corr = 0 # inter-predictor correlation
+n1 = 25 # treated individuals
+n0 = 25 # untreated
+valid_sigma = 1.8 # this corresponds to avg U_Y = 0.9
+prop_invalid_grid = seq(0,1,0.1) # proportions of invalid surrogates in gamma to test
+n_sim = 500 # number of simulations
+
+# evaluate true surrogate strength
+# truth <- calc.truth(p = 500, prop_valid=1, valid_sigma, corr, mode = "simple")
+# mean(truth$us_true)
+
+p_evaluate_df = as.data.frame(matrix(0,nrow = n_sim, ncol = length(prop_invalid_grid)))
+colnames(p_evaluate_df) = prop_invalid_grid
+for (i in 1:length(prop_invalid_grid)){
+  for (j in 1:n_sim){
+    prop_invalid = prop_invalid_grid[i]
+    prop_valid = 1 - prop_invalid 
+    
+    data = gen.data(n1, n0, p, prop_valid, valid_sigma, corr, mode = "simple")
+    
+    # get weights from screening function
+    Y = c(data$y1,data$y0)
+    A = c(rep(1,n1), rep(0,n0))
+    X = rbind(data$s1, data$s0)
+    colnames(X) = c(1:ncol(X))
+    
+    u_y_estimated <- test.surrogate(
+      yone = data$y1, yzero = data$y0, sone = data$y1, szero = data$y0, epsilon = 0.1
+    )$u.y
+    # u_y_true = truth$uy_true
+    # choose epsilon as maximum of estimated value of UY - 0.5 and 0
+    eps <- max(0, u_y_estimated - 0.5)
+    
+    screen_res = rise_screen(Y, X, A, reference = "0", 
+                             alpha = 0.05, epsilon = eps,
+                             p_correction = "none", cores = 1)
+    
+    weights = data.frame("marker" = colnames(X),
+                         "weight" = abs(1/screen_res$results[,"delta"]))
+    res_evaluate = rise_evaluate(Y_evaluate = Y, X_evaluate = X, A_evaluate = A,
+                                 markers = colnames(X), power_desired = 0.8,
+                                 weights = weights, plot = F, alpha = 0.05)
+    
+    p_evaluate_df[j,i] = res_evaluate$evaluation_results[,"p_unadjusted"]
+    print(paste0("Prop. invalid = ", prop_invalid_grid[i],  " : Simulation ", j, " of ", n_sim, " complete."))
+  }
+}
+save(p_evaluate_df, file = "./output/simulation/metrics_figures9a.Rdata")
+```
+
+### b
+Data generation process 1: the distributions of the p-values in the evaluation step are examined as a function of the false discovery proportion which make up $\widehat{\gamma}_{\mathcal{S}}$, which consists of a combination of $100$ predictors. The sample size is $n = 50$ and the valid surrogate strength is $\widehat{U_{S_{j}}} = 0.9$. The nominal significance level $\alpha = 0.05$ is plotted as a dashed red line. Desired power for the new surrogate was fixed at $80\%$. 
+```{r}
+# Step 1 : construct a marker as a combination of true and false positives
+# Keep true positives strong on average : U_Y = 0.9
+source("./R/rise_evaluate.R")
+source("./R/rise_screen.R")
+alpha <- 0.05 # nominal significance level
+beta <- 0.2 # desired power for univariate surrogate test = (1-beta)*100% 
+s0_mean <- 0 # invalid surrogate mean value in untreated group
+s0_sd <- 1 # invalid surrogate sd value in untreated group
+s1_mean <- 0 # invalid surrogate mean value in treated group
+s1_sd <- 2 # invalid surrogate sd value in treated group
+y0_mean <- 0 # primary response mean value in untreated group
+y0_sd <- 1 # primary response sd value in untreated group
+y1_mean <- 3 # primary response mean value in treated group
+y1_sd <- 1 # primary response sd value in treated group
+p <- 10 # total number of predictors
+corr = 0 # inter-predictor correlation
+n1 = 25 # treated individuals
+n0 = 25 # untreated
+valid_sigma = 1.8 # this corresponds to avg U_Y = 0.9
+prop_invalid_grid = seq(0,1,0.1) # proportions of invalid surrogates in gamma to test
+n_sim = 500 # number of simulations
+
+# evaluate true surrogate strength
+# truth <- calc.truth(p = 500, prop_valid=1, valid_sigma, corr, mode = "simple")
+# mean(truth$us_true)
+
+p_evaluate_df = as.data.frame(matrix(0,nrow = n_sim, ncol = length(prop_invalid_grid)))
+colnames(p_evaluate_df) = prop_invalid_grid
+for (i in 10:length(prop_invalid_grid)){
+  for (j in 1:n_sim){
+    prop_invalid = prop_invalid_grid[i]
+    prop_valid = 1 - prop_invalid 
+    
+    data = gen.data(n1, n0, p, prop_valid, valid_sigma, corr, mode = "simple")
+    
+    # get weights from screening function
+    Y = c(data$y1,data$y0)
+    A = c(rep(1,n1), rep(0,n0))
+    X = rbind(data$s1, data$s0)
+    colnames(X) = c(1:ncol(X))
+    
+    u_y_estimated <- test.surrogate(
+      yone = data$y1, yzero = data$y0, sone = data$y1, szero = data$y0, epsilon = 0.1
+    )$u.y
+    # u_y_true = truth$uy_true
+    # choose epsilon as maximum of estimated value of UY - 0.5 and 0
+    eps <- max(0, u_y_estimated - 0.5)
+    
+    screen_res = rise_screen(Y, X, A, reference = "0", 
+                             alpha = 0.05, epsilon = eps,
+                             p_correction = "none", cores = 1)
+    
+    weights = data.frame("marker" = colnames(X),
+                         "weight" = abs(1/screen_res$results[,"delta"]))
+    res_evaluate = rise_evaluate(Y_evaluate = Y, X_evaluate = X, A_evaluate = A,
+                                 markers = colnames(X), power_desired = 0.8,
+                                 weights = weights, plot = F, alpha = 0.05)
+    
+    p_evaluate_df[j,i] = res_evaluate$evaluation_results[,"p_unadjusted"]
+    print(paste0("Prop. invalid = ", prop_invalid_grid[i],  " : Simulation ", j, " of ", n_sim, " complete."))
+  }
+}
+save(p_evaluate_df, file = "./output/simulation/metrics_figures9b.Rdata")
+```
+
+```{r}
+p_evaluate_dfa = get(load("./output/simulation/metrics_figures9a.Rdata"))
+
+p_evaluate_longa <- p_evaluate_dfa %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  mutate(variable = as.numeric(variable))  # Convert variable names to numeric
+
+# Create the violin plot
+fig4a = ggplot(p_evaluate_longa, aes(x = as.factor(variable), y = value)) +
+  geom_boxplot(outlier.shape = NA) +
+  labs(
+    x = "Proportion of invalid surrogates",
+    y = "P-value",
+    title = expression("Evaluation stage P-values as a function of the proportion of false positives in " * gamma[S])
+  ) +
+  geom_hline(yintercept = 0.05, colour = "maroon", linetype = "longdash", linewidth = 1, alpha = 0.6) +
+  theme_minimal(base_size = 26) +
+  theme(plot.title = element_blank(),
+        plot.background = element_rect(fill = 'white', color = 'white'),
+        legend.position = "none") +
+  scale_fill_brewer(palette = "Spectral")
+
+p_evaluate_dfb = get(load("./output/simulation/metrics_figures9b.Rdata"))
+
+p_evaluate_longb <- p_evaluate_dfb %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  mutate(variable = as.numeric(variable))  # Convert variable names to numeric
+
+# Create the violin plot
+fig4b = ggplot(p_evaluate_longb, aes(x = as.factor(variable), y = value)) +
+  geom_boxplot(outlier.shape = NA) +
+  labs(
+    x = "Proportion of invalid surrogates",
+    y = "P-value",
+    title = expression("Evaluation stage P-values as a function of the proportion of false positives in " * gamma[S])
+  ) +
+  geom_hline(yintercept = 0.05, colour = "maroon", linetype = "longdash", linewidth = 1, alpha = 0.6) +
+  theme_minimal(base_size = 26) +
+  theme(plot.title = element_blank(),
+        plot.background = element_rect(fill = 'white', color = 'white'),
+        legend.position = "none",
+        axis.title.y = element_blank()) +
+  scale_fill_brewer(palette = "Spectral")
+
+# Create label-only plots
+label_a <- ggdraw() + draw_label("a)", fontface = "bold", size = 35, x = 0, hjust = 0)
+label_b <- ggdraw() + draw_label("b)", fontface = "bold", size = 35, x = 0, hjust = 0)
+
+# Combine labels into a row
+label_row <- plot_grid(label_a, label_b, ncol = 2)
+
+# Combine with the actual plots
+fig8ab <- plot_grid(
+  label_row,
+  plot_grid(fig4a, fig4b, ncol = 2),
+  ncol = 1,
+  rel_heights = c(0.1, 1)  # Adjust to control space for labels
+)
+
+# Save
+ggsave(
+  plot = fig8ab,
+  filename = "figureS9.eps",
+  path = "./output/figures/",
+  units = "cm",
+  width = 65,
+  height = 22,   # slightly taller to accommodate labels
+  dpi = 800
+)
+
+ggsave(
+  plot = fig8ab,
+  filename = "figureS9.pdf",
+  path = "./output/figures/",
+  units = "cm",
+  width = 65,
+  height = 22,   # slightly taller to accommodate labels
+  dpi = 800
+)
+```
+
+### Debugging
+```{r}
+# Load functions for RISE
+# Define the folder path
+folder_path <- "./R/"
+# Get all .R files in the folder
+r_files <- list.files(path = folder_path, pattern = "\\.R$", full.names = TRUE)
+# Source each file
+sapply(r_files, source)
+
+# Set up the values to simulate
+alpha <- 0.05 # nominal significance level
+beta <- 0.2 # desired power for univariate surrogate test = (1-beta)*100% 
+s0_mean <- 0 # invalid surrogate mean value in untreated group
+s0_sd <- 1 # invalid surrogate sd value in untreated group
+s1_mean <- 0 # invalid surrogate mean value in treated group
+s1_sd <- 2 # invalid surrogate sd value in treated group
+y0_mean <- 0 # primary response mean value in untreated group
+y0_sd <- 1 # primary response sd value in untreated group
+y1_mean <- 1 # primary response mean value in treated group
+y1_sd <- 1 # primary response sd value in treated group
+p <- 500 # total number of predictors
+valid_sigma = 5
+n1 <- 50
+n0 = 50
+n_sim = 1
+prop_valid = 1
+corr = 0
+mode = "simple"
+data = gen.data(n1,n0,p,prop_valid,valid_sigma,corr,mode)
+
+full.data = NULL
+epsilon = NULL
+power.want.s = 0.8
+u.y.hyp = NULL
+alpha = 0.05 
+mode = "paired" 
+test = "two.one.sided"
+yone = data$y1
+yzero = data$y0
+sone = data$s1[,1]
+szero = data$s0[,1]
+```
+
