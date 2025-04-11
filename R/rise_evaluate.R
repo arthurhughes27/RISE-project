@@ -97,7 +97,7 @@ rise_evaluate = function(Y_evaluate,
       szero = X_evaluate[which(A_evaluate == 0),ind]
       
       if (is.null(epsilon)){
-        ss.test = test.surrogate.paired(yone = yone, 
+        ss.test = test.surrogate(yone = yone, 
                                         yzero = yzero, 
                                         sone = sone, 
                                         szero = szero, 
@@ -105,7 +105,7 @@ rise_evaluate = function(Y_evaluate,
                                         mode = mode,
                                         test = test)
       } else {
-        ss.test = test.surrogate.paired(yone = yone, 
+        ss.test = test.surrogate(yone = yone, 
                                         yzero = yzero, 
                                         sone = sone, 
                                         szero = szero, 
@@ -168,7 +168,7 @@ rise_evaluate = function(Y_evaluate,
   szero = gamma[which(A_evaluate == 0)]
   
   if (is.null(epsilon)){
-    ss.test = test.surrogate.paired(yone = yone, 
+    ss.test = test.surrogate(yone = yone, 
                                     yzero = yzero, 
                                     sone = sone, 
                                     szero = szero, 
@@ -176,7 +176,7 @@ rise_evaluate = function(Y_evaluate,
                                     mode = mode,
                                     test = test)
   } else {
-    ss.test = test.surrogate.paired(yone = yone, 
+    ss.test = test.surrogate(yone = yone, 
                                     yzero = yzero, 
                                     sone = sone, 
                                     szero = szero, 

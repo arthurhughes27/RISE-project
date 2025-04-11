@@ -90,7 +90,7 @@ rise_screen = function(Y,
     szero = X[which(A == 0),ind]
     
     if (is.null(epsilon)){
-      ss.test = test.surrogate.paired(yone = yone, 
+      ss.test = test.surrogate(yone = yone, 
                                       yzero = yzero, 
                                       sone = sone, 
                                       szero = szero, 
@@ -98,7 +98,7 @@ rise_screen = function(Y,
                                       mode = mode,
                                       test = test)
     } else {
-      ss.test = test.surrogate.paired(yone = yone, 
+      ss.test = test.surrogate(yone = yone, 
                                       yzero = yzero, 
                                       sone = sone, 
                                       szero = szero, 
