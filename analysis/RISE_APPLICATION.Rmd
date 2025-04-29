@@ -1,0 +1,1397 @@
+---
+title: "RISE_application_ver2"
+author: "Arthur Hughes"
+date: "2025-01-15"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+# Setup
+Set R markdown options and seed for reproducibility. 
+
+```{r}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+
+set.seed(18042025) # The date when the data analysis was performed
+```
+
+
+Load packages. 
+```{r, eval = F}
+# Packages
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(stringr)
+library(SurrogateRank)
+library(readr)
+library(parallel)
+library(pbmcapply)
+library(caTools)
+library(here)
+library(xtable)
+library(cowplot)
+library(caret)
+library(ggrepel)
+library(GSA)
+library(readxl)
+library(janitor)
+```
+
+Define a function which converts data frames into latex tables for easy outputting. 
+```{r}
+myxtable <- function(x, ...) xtable(apply(x, 2, as.character), ...)
+```
+
+Load the publicly available cross-study normalised transcriptomic data and neutralising antibody responses from ImmuneSpace.org, ImmuneSignatures2 study (https://datatools.immunespace.org/project/HIPC/IS2/begin.view?). 
+
+```{r}
+# Raw (normalised) transcriptomic data
+all_norm_eset <- readRDS("/home/ah3/Bureau/Work/PhD/data management/data/raw/HIPC/all_norm_eset.rds")
+
+# Raw neutralising antibody response data
+neutralising_antibodies = read_excel("~/Bureau/Work/PhD/data management/data/raw/HIPC/neut_ab_titer_2025-01-10_01-13-22.xlsx") %>% 
+  clean_names()
+```
+
+# Data preprocessing
+We download publically available data and preprocess it here from start to finish. 
+We need to wrangle the data a bit. First, link the gene expression data to the clinical data. 
+
+```{r}
+clinical_data = all_norm_eset@phenoData@data # clinical data - samples X variables
+expression_data = all_norm_eset@assayData[["exprs"]] # expression data - genes X samples
+expression_clinical_data = bind_cols( # combined clinical and expression data - samples X variables
+  clinical_data,
+  t(expression_data),
+)
+```
+
+Now we subset the data by the female recipients of the 2008 inactivated influenza vaccines, who have available gene expression data at BOTH days 0 and 1.
+
+```{r}
+expression_clinical_data_filtered <- expression_clinical_data %>%
+  # 1) restrict to your subgroup & times
+  filter(
+    pathogen == "Influenza",
+    vaccine  == "TIV (2008)",
+    gender   == "Female",
+    study_time_collected %in% c(0, 1)
+  ) %>%
+  # 2) rename for clarity
+  rename(expression_time = study_time_collected) %>%
+  # 3) drop any rows where A1CF is missing
+  filter(!is.na(A1CF)) %>%
+  # 4) only keep participants with BOTH 0 and 1
+  group_by(participant_id) %>%
+  filter(n_distinct(expression_time) == 2) %>%
+  ungroup()
+
+# Extract the participant IDs of the filtered data
+filtered_ids = expression_clinical_data_filtered %>% 
+  pull(participant_id) %>% 
+  unique()
+```
+
+Now, we find the neutralising antibody responses at both days 0 and day 28 corresponding to these participants.
+
+```{r}
+nab_filtered <- neutralising_antibodies %>%
+  # keep only the time‐points of interest
+  filter(
+    participant_id %in% filtered_ids,
+    study_time_collected %in% c(0, 28),
+    !is.na(value_preferred)
+  )
+```
+
+Since there are 3 viral strains involved in this vaccine, we create a composite response measure by taking the within-time mean of the 3 strains for each patient. 
+
+```{r}
+nab_composite <- nab_filtered %>%
+  group_by(participant_id, study_time_collected) %>%
+  summarize(
+    response = mean(value_preferred, na.rm = TRUE),
+    .groups = "drop"
+  ) %>% 
+  rename("response_time" = study_time_collected) %>%
+  # within each participant, require exactly two distinct times (0 and 28)
+  group_by(participant_id) %>%
+  filter(n_distinct(response_time) == 2) %>%
+  ungroup()
+```
+
+Now we link the responses to the clinical and expression dataframe.
+
+```{r}
+expression_clinical_response_data_filtered <- expression_clinical_data_filtered %>%
+  mutate(response_time = if_else(expression_time == 0, 0L, 28L)) %>%
+  right_join(
+    nab_composite,
+    by = c("participant_id", "response_time")
+  )
+```
+
+Select only the relevant columns in the data for the analysis. Create a variable "treatment" which gives 1 if the sample is post-vaccination and 0 if baseline. 
+
+```{r}
+expression_clinical_response_data_filtered = expression_clinical_response_data_filtered %>% 
+  mutate(treatment = ifelse(expression_time == 1, 1, 0)) %>% 
+  select(
+    participant_id, 
+    treatment,
+    response, 
+    A1CF:ZZZ3 # all genes
+    ) %>% 
+  arrange(participant_id,treatment)
+```
+
+Now do random sample splitting on the participant IDs to assign participants to either screening or evaluation sets. 
+```{r}
+# Total number of genes in the data
+n_genes = expression_clinical_response_data_filtered %>% 
+  select(A1CF:ZZZ3) %>% 
+  ncol()
+
+# Names of the genes
+gene_names = expression_clinical_response_data_filtered %>% 
+  select(A1CF:ZZZ3) %>% 
+  colnames()
+
+# Sample splitting
+train_ids <- expression_clinical_response_data_filtered %>%
+  distinct(participant_id) %>%
+  slice_sample(prop = 0.75) %>%
+  pull(participant_id)
+
+# Step 2: Filter the long dataframe to include only the sampled participants
+train_df <- expression_clinical_response_data_filtered %>%
+  filter(participant_id %in% train_ids)
+
+test_df <- expression_clinical_response_data_filtered %>%
+  filter(!(participant_id %in% train_ids))
+```
+
+# Functions for RISE
+Define functions to perform the RISE methodology. 
+
+## Helper functions
+
+Function for estimating the power of a test based solely on the observation of a surrogate marker. 
+```{r}
+est.power = function(n.total, rho=0.80, u.y.alt,delta.alt, power.want.s = 0.7){
+  delta.se.est = sqrt(2*(1-rho)/(3*n.total))
+  sd.null = sqrt((n.total+1)/(3*n.total^2))
+  z.alpha.2 = qnorm(0.975)
+  u.s.power = 1/2-(qnorm(1-power.want.s)-z.alpha.2)*(sd.null)
+  z.alpha = qnorm(0.95)
+  est.power = pnorm((1/delta.se.est)*(u.y.alt - u.s.power-delta.alt) - z.alpha)
+  return(est.power)
+}
+```
+
+Helper function for wilcox test. 
+```{r}
+#in delong paper x = a, y = b
+my.wilcox = function(x,y) {
+  if(x>y) return(1)
+  if(x==y) return(1/2)
+  if(x<y) return(0)
+}
+```
+
+Function to estimate the delta statistics
+```{r}
+#' Calculate Delta: Difference in Rank-based Statistics for Two Outcomes
+#'
+#' This function estimates the difference (`delta`) between two rank-based statistics
+#' (e.g., Wilcoxon statistics or paired ranks) for a primary outcome and a surrogate,
+#' under either an independent or paired design.
+#'
+#' @param full.data Optional. A data matrix or data frame with three columns:
+#'   - Column 1: Primary outcome (y)
+#'   - Column 2: Surrogate variable (s)
+#'   - Column 3: Treatment indicator (0 or 1)
+#'   If `full.data` is provided, individual vectors (`yone`, `yzero`, `sone`, `szero`) are ignored.
+#' 
+#' @param yone Numeric vector of outcome values in the treatment group.
+#' @param yzero Numeric vector of outcome values in the control group.
+#' @param sone Numeric vector of surrogate values in the treatment group.
+#' @param szero Numeric vector of surrogate values in the control group.
+#' @param mode Character. Either "independent" (default) or "paired" to specify
+#'        the study design.
+#'
+#' @return A list with the following elements:
+#'   - `u.y`: Rank-based test statistic for the primary outcome
+#'   - `u.s`: Rank-based test statistic for the surrogate
+#'   - `delta.estimate`: Estimated difference between outcome and surrogate statistics
+#'   - `sd.u.y`: Standard deviation of the outcome statistic
+#'   - `sd.u.s`: Standard deviation of the surrogate statistic
+#'   - `sd.delta`: Standard error of the delta estimate
+
+delta.calculate = function(full.data = NULL, yone = NULL, yzero = NULL, sone = NULL, 
+                           szero = NULL, mode = "independent") 
+{
+  # If full.data is provided, extract outcome and surrogate values by treatment group
+  if (!is.null(full.data)) {
+    yone  = full.data[full.data[, 3] == 1, 1]  # outcome, treatment group
+    yzero = full.data[full.data[, 3] == 0, 1]  # outcome, control group
+    sone  = full.data[full.data[, 3] == 1, 2]  # surrogate, treatment group
+    szero = full.data[full.data[, 3] == 0, 2]  # surrogate, control group
+  }
+  
+  if (mode == "independent") {
+    # Use Wilcoxon rank-sum test for independent samples
+    test.y = wilcox.test(yone, yzero, exact = FALSE)
+    test.s = wilcox.test(sone, szero, exact = FALSE)
+    
+    # Normalize test statistics to estimate U statistics
+    n1.f = length(yone)
+    n0.f = length(yzero)
+    u.y = (n1.f * n0.f)^(-1) * test.y$statistic
+    u.s = (n1.f * n0.f)^(-1) * test.s$statistic
+    delta.estimate = u.y - u.s
+    
+    # Estimate the variance using Hajek projection variance estimators
+    m.count = n1.f
+    n.count = n0.f
+    
+    # Variance components from treated group comparisons
+    V10.Xi.Y = sapply(yone, var.wil, b = yzero)
+    V10.Xi.S = sapply(sone, var.wil, b = szero)
+    
+    # Variance components from control group comparisons (flip ranks)
+    V01.Yj.Y = sapply(yzero, var.wil, b = yone, flip = TRUE)
+    V01.Yj.S = sapply(szero, var.wil, b = sone, flip = TRUE)
+    
+    # Covariance matrix components from treated group
+    s10.11.YY = var(V10.Xi.Y)
+    s10.12.YS = cov(V10.Xi.Y, V10.Xi.S)
+    s10.22.SS = var(V10.Xi.S)
+    s10.21.SY = cov(V10.Xi.Y, V10.Xi.S)  # same as s10.12
+    
+    # Covariance matrix components from control group
+    s01.11.YY = var(V01.Yj.Y)
+    s01.12.YS = cov(V01.Yj.Y, V01.Yj.S)
+    s01.22.SS = var(V01.Yj.S)
+    s01.21.SY = cov(V01.Yj.Y, V01.Yj.S)
+    
+    # Combine into covariance matrices
+    S10 = matrix(c(s10.11.YY, s10.12.YS, s10.21.SY, s10.22.SS), nrow = 2)
+    S01 = matrix(c(s01.11.YY, s01.12.YS, s01.21.SY, s01.22.SS), nrow = 2)
+    
+    # Total variance matrix
+    S.mat = (1/m.count) * S10 + (1/n.count) * S01
+    
+    # Standard deviations for outcome and surrogate
+    sd.y = sqrt(S.mat[1, 1])
+    sd.s = sqrt(S.mat[2, 2])
+    
+    # Linear combination L = (1, -1) to compute variance of delta = u.y - u.s
+    L = t(as.matrix(c(1, -1)))
+    sd.est = sqrt(L %*% S.mat %*% t(L))
+    
+  } else if (mode == "paired") {
+    # For paired samples, use within-pair comparisons
+    n = length(yone)
+    
+    # Proportion of pairs where yone > yzero (similar to concordance)
+    u.y = mean(ifelse(yone > yzero, 1, 0))
+    u.s = mean(ifelse(sone > szero, 1, 0))
+    delta.estimate = u.y - u.s
+    
+    # Estimate variances
+    sd.y = sd(ifelse(yone > yzero, 1, 0))
+    sd.s = sd(ifelse(sone > szero, 1, 0))
+    
+    # Difference in indicators for each pair
+    di = ifelse(yone > yzero, 1, 0) - ifelse(sone > szero, 1, 0)
+    var_delta = var(di) / n
+    sd.est = sqrt(var_delta)
+  }
+  
+  # Return a list of results
+  return(list(
+    u.y = as.numeric(u.y),
+    u.s = as.numeric(u.s),
+    delta.estimate = as.numeric(delta.estimate),
+    sd.u.y = sd.y,
+    sd.u.s = sd.s,
+    sd.delta = as.numeric(sd.est)
+  ))
+}
+
+```
+
+Helper function to evaluate the variance of wilcoxon test statistics
+```{r}
+#a is one number, b is vector
+var.wil = function(a, b, flip = FALSE){
+  if(!flip) return(mean(sapply(b, my.wilcox, x= a)))
+  if(flip) return(mean(sapply(b, my.wilcox, y= a)))
+}
+```
+
+
+Function to perform surrogate testing 
+
+```{r}
+#' Rank-Based test for Trial-level Surrogacy
+#'
+#' This function tests whether a candidate surrogate marker explains the treatment effect
+#' using a rank-based non-inferiority framework. It computes the difference in treatment effects 
+#' on the outcome and surrogate and checks whether the loss is within an acceptable margin.
+#'
+#' @param full.data Optional data matrix with 3 columns: outcome, surrogate, and treatment indicator (1 = treatment, 0 = control).
+#' @param yone Outcome values for the treatment group (ignored if \code{full.data} is provided).
+#' @param yzero Outcome values for the control group.
+#' @param sone Surrogate values for the treatment group.
+#' @param szero Surrogate values for the control group.
+#' @param epsilon Optional non-inferiority margin. If \code{NULL}, it will be estimated using \code{power.want.s}.
+#' @param power.want.s Desired power for the surrogate effect (default is 0.7). Used to estimate \code{epsilon} if not provided.
+#' @param u.y.hyp Optional hypothesized value for treatment effect on the outcome (\code{u.y}).
+#'        If provided, \code{epsilon} is computed as \code{u.y.hyp - u.s.power}.
+#' @param alpha Significance level for the one-sided test (default is 0.05).
+#' @param mode Either \code{"independent"} (default) or \code{"paired"} depending on study design.
+#' @param test Type of test procedure to conduct. Default is \code{"non.inferiority"}, where a candidate is 
+#'        declared a valid trial-level surrogate if the treatment effect on it is at least at great as the 
+#'        treatment effect on the outcome. The alternative is \code{"two.one.sided"}, which performs two one sided 
+#'        non-inferiority tests to determine if the treatment effect is within a symmetric interval of width 2 epsilon
+#'        around the treatment effect on the outcome. 
+#' 
+#' 
+#'
+#' @return A list containing:
+#' \describe{
+#'   \item{\code{u.y}}{Estimated rank-based treatment effect on the outcome.}
+#'   \item{\code{u.s}}{Estimated rank-based treatment effect on the surrogate.}
+#'   \item{\code{delta.estimate}}{Estimated difference in treatment effects: \code{u.y - u.s}.}
+#'   \item{\code{sd.u.y}}{Standard deviation of \code{u.y}.}
+#'   \item{\code{sd.u.s}}{Standard deviation of \code{u.s}.}
+#'   \item{\code{sd.delta}}{Standard deviation of \code{delta.estimate}.}
+#'   \item{\code{ci.delta}}{One-sided confidence interval upper bound for \code{delta.estimate}.}
+#'   \item{\code{p.delta}}{p-value for validity of trial-level surrogacy.}
+#'   \item{\code{epsilon.used}}{Non-inferiority threshold used in the test.}
+#'   \item{\code{is.surrogate}}{\code{TRUE} if the surrogate passes the test, else \code{FALSE}.}
+#' }
+#'
+#' @examples
+#' set.seed(123)
+#' yone <- rnorm(50, mean = 1)
+#' yzero <- rnorm(50, mean = 0)
+#' sone <- rnorm(50, mean = 0.8)
+#' szero <- rnorm(50, mean = 0)
+#' test.surrogate(yone = yone, yzero = yzero, sone = sone, szero = szero)
+#'
+#' @export
+
+
+test.surrogate = function (full.data = NULL, yone = NULL, yzero = NULL, sone = NULL, 
+                                  szero = NULL, epsilon = NULL, power.want.s = 0.7, u.y.hyp = NULL,
+                                  alpha = 0.05, mode = "independent", test = "non.inferiority") 
+{
+  # Validity checks
+  if (mode == "paired"){
+    if (length(yone) != length(yzero)){
+      stop("You have requested the paired setting mode
+           but the lengths of yone and yzero do not match.
+           Ensure that the kth element of yzero is matched
+           to the kth element of yone.")
+    } else if (length(sone) != length(szero)){
+      stop ("You have requested the paired setting mode
+           but the lengths of sone and szero do not match.
+           Ensure that the kth element of szero is matched
+           to the kth element of sone.")
+    }
+  }
+  
+  # Extract variables from full.data if provided
+  if (!is.null(full.data)) {
+    yone = full.data[full.data[, 3] == 1, 1]
+    yzero = full.data[full.data[, 3] == 0, 1]
+    sone = full.data[full.data[, 3] == 1, 2]
+    szero = full.data[full.data[, 3] == 0, 2]
+  }
+  
+  # Compute treatment effects and standard errors using delta.calculate()
+  dd = delta.calculate(yone = yone, yzero = yzero, sone = sone, 
+                              szero = szero, mode = mode)
+  
+  # If epsilon is not provided, estimate it based on power.want.s
+  if (is.null(epsilon) & mode == "independent") {
+    n1 = length(yone)
+    n0 = length(yzero)
+    
+    # Null SD under Wilcoxon/Mann-Whitney assumptions
+    sd.null = sqrt((n1 + n0 + 1) / (12 * n1 * n0))
+    
+    # Adjust quantiles for two-sided test and power calculation
+    z.alpha.2 = qnorm(1 - (alpha / 2))
+    u.s.power = 0.5 - (qnorm(1 - power.want.s) - z.alpha.2) * sd.null
+    
+    # Estimate epsilon as the difference between observed u.y (or hypothesized) and u.s under power
+    if (is.null(u.y.hyp)) {
+      epsilon = dd$u.y - u.s.power
+    } else {
+      epsilon = u.y.hyp - u.s.power
+    }
+  } else if (is.null(epsilon) & mode == "paired"){
+    # If epsilon is not provided, estimate it based on power.want.s
+    n = length(yone)
+    
+    # Null SD under paired-setting assumptions
+    ## First estimate the probability of ties in the responses 
+    pi = mean(yone == yzero)
+    ## Now estimate the null
+    sd.null = sqrt((1-pi)/(4*n))
+
+    # Adjust quantiles for two-sided test and power calculation
+    z.alpha.2 = qnorm(1 - (alpha / 2))
+    u.s.power = 0.5 - (qnorm(1 - power.want.s) - z.alpha.2) * sd.null
+    
+    # Estimate epsilon as the difference between observed u.y (or hypothesized) and u.s under power
+    if (is.null(u.y.hyp)) {
+      epsilon = dd$u.y - u.s.power
+    } else {
+      epsilon = u.y.hyp - u.s.power
+    }
+  }
+  
+  if (test == "non.inferiority"){
+    # Compute upper bound of one-sided (1 - alpha) CI for delta = u.y - u.s
+    z.alpha = qnorm(1 - alpha)
+    ci.delta = c(-1, dd$delta.estimate + z.alpha * dd$sd.delta)  # CI = (-∞, upper bound]
+    
+    # Decision rule for non-inferiority:
+    # If upper bound of CI is less than epsilon, surrogate is acceptable
+    is.surrogate = ci.delta[2] < epsilon
+    
+    # Compute a corresponding p-value 
+    p = pnorm(dd$delta.estimate, 
+              epsilon, 
+              dd$sd.delta)
+    
+  } else if (test == "two.one.sided"){
+    n = length(yone)
+    # Compute (1 - 2*alpha) CI for delta = u.y - u.s
+    z.alpha = qnorm(1 - alpha)
+    ci.delta = c(dd$delta.estimate - z.alpha * dd$sd.delta, 
+                 dd$delta.estimate + z.alpha * dd$sd.delta)
+    
+    # Calculate p-value corresponding to null: delta > epsilon
+    p1 = pnorm(dd$delta.estimate, 
+               epsilon, 
+               dd$sd.delta)
+    
+    # Calculate p-value corresponding to null: delta < -epsilon
+    p2 = pnorm(dd$delta.estimate, 
+               -epsilon, 
+               dd$sd.delta, 
+               lower.tail = F)
+    
+    
+    
+    p = max(p1,p2)
+    
+    is.surrogate = p < alpha
+  }
+  
+  # Return all relevant quantities
+  return(list(
+    u.y = as.numeric(dd$u.y),
+    u.s = as.numeric(dd$u.s),
+    delta.estimate = as.numeric(dd$delta.estimate),
+    sd.u.y = dd$sd.u.y,
+    sd.u.s = dd$sd.u.s,
+    sd.delta = as.numeric(dd$sd.delta),
+    ci.delta = ci.delta,
+    p.delta = p,
+    epsilon.used = epsilon,
+    is.surrogate = is.surrogate
+  ))
+}
+
+```
+
+## Screening function
+
+Function which screens each individual marker with the rank-based test and applies a multiple testing correction to the p-values. 
+
+```{r}
+#' Applies the RISE screening process to identify candidate surrogates
+#'
+#' @description
+#' Runs a rank-based non-inferiority or two-one-sided test on each candidate marker
+#' to screen for trial-level surrogates.
+#'
+#' @param Y Numeric vector of primary response values.
+#' @param X Numeric matrix or data.frame of surrogate candidates (columns);
+#'   rows correspond to entries in \code{Y}.
+#' @param A Binary vector of treatment assignments (same length as \code{Y}).
+#' @param reference Character. Level in \code{A} to treat as the control/reference.
+#' @param alpha Numeric significance threshold for selecting surrogates. Default: 0.05.
+#' @param power_desired Numeric in (0,1) desired power for the surrogate test.
+#'   Either \code{power_desired} or \code{epsilon} must be provided.
+#' @param epsilon Numeric in (0,1) non-inferiority margin. Either \code{epsilon}
+#'   or \code{power_desired} must be provided.
+#' @param p_correction Character. Method for p-value adjustment (see \code{p.adjust}).
+#'   Default: \code{"none"}.
+#' @param cores Integer number of parallel cores. Default: 1.
+#' @param mode Character. \code{"independent"} (default) or \code{"paired"}.
+#' @param test Character. \code{"non.inferiority"} (default) or \code{"two.one.sided"}.
+#'
+#' @return A list with:
+#'   \itemize{
+#'     \item \code{results}: data.frame of surrogate test results (delta, CI, sd, margins, p-values).
+#'     \item \code{significant_markers}: character vector of markers with \code{p_adjusted < alpha}.
+#'     \item \code{weights}: data.frame of \code{marker} and corresponding \code{weight = delta}.
+#'   }
+#'
+#' @import dplyr pbmcapply SurrogateRank
+#' @export
+rise_screen <- function(
+    Y,
+    X,
+    A,
+    reference    = NULL,
+    alpha        = 0.05,
+    power_desired= NULL,
+    epsilon      = NULL,
+    p_correction = "none",
+    cores        = 1,
+    mode         = "independent",
+    test         = "non.inferiority"
+) {
+  # -- Input validation ------------------------------------------------------
+  n_obs <- length(Y)
+  if (nrow(X) != n_obs) {
+    stop("nrow(X) must equal length(Y)")
+  }
+  if (length(A) != n_obs) {
+    stop("length(A) must equal length(Y)")
+  }
+  if (is.null(power_desired) && is.null(epsilon)) {
+    stop("Must specify either 'power_desired' or 'epsilon'")
+  }
+  
+  # -- Prepare data ----------------------------------------------------------
+  X_mat <- as.matrix(X)
+  Y_vec <- as.numeric(Y)
+  A_fac <- factor(
+    as.character(A),
+    levels = c(setdiff(unique(A), reference), reference),
+    labels = c("1", "0")
+  )
+  
+  # -- Per-marker surrogate test function -----------------------------------
+  .test_marker <- function(idx) {
+    # split outcome and marker by treatment
+    y1 <- Y_vec[A_fac == "1"]
+    y0 <- Y_vec[A_fac == "0"]
+    s1 <- X_mat[A_fac == "1", idx]
+    s0 <- X_mat[A_fac == "0", idx]
+    
+    args <- list(
+      yone  = y1,
+      yzero = y0,
+      sone  = s1,
+      szero = s0,
+      mode  = mode,
+      test  = test
+    )
+    if (is.null(epsilon)) {
+      args$`power.want.s` <- power_desired
+    } else {
+      args$epsilon <- epsilon
+    }
+    
+    res <- do.call(test.surrogate, args)
+    c(
+      delta       = res$delta.estimate,
+      ci_lower    = res$ci.delta[1],
+      ci_upper    = res$ci.delta[2],
+      sd          = res$sd.delta,
+      epsilon     = res$epsilon.used,
+      p_unadjusted= res$p.delta
+    )
+  }
+  
+  # -- Run in parallel over all P markers -----------------------------------
+  P <- ncol(X_mat)
+  raw_list <- pbmclapply(1:P, .test_marker, mc.cores = cores)
+  
+  # -- Assemble results table -----------------------------------------------
+  results <- do.call(rbind, raw_list) %>%
+    as.data.frame(stringsAsFactors = FALSE) %>%
+    mutate(
+      marker        = colnames(X_mat),
+      p_adjusted    = p.adjust(p_unadjusted, method = p_correction)
+    ) %>%
+    select(marker, epsilon, delta, sd, ci_lower, ci_upper, p_unadjusted, p_adjusted)
+  
+  # -- Select significant markers and weights -------------------------------
+  significant_markers <- results %>%
+    filter(p_adjusted < alpha) %>%
+    pull(marker)
+  
+  weights <- results %>%
+    filter(marker %in% significant_markers) %>%
+    transmute(marker, weight = delta)
+  
+  # -- Return ---------------------------------------------------------------
+  list(
+    results             = results,
+    significant_markers = significant_markers,
+    weights             = weights
+  )
+}
+
+```
+
+
+## Evaluation function
+
+Function to apply the evaluation stage of the RISE procedure to assess surrogate strength
+
+```{r}
+#' Applies the evaluation stage of the RISE procedure to assess surrogate strength
+#'
+#' @description
+#' Evaluates a weighted linear combination of standardized surrogate markers
+#' against the primary response. Supports individual marker evaluation and
+#' combined surrogate evaluation with non-inferiority or two one-sided tests.
+#'
+#' @param Y_evaluate Numeric vector of primary response values in the evaluation set.
+#' @param X_evaluate Numeric matrix or data.frame of surrogate candidates (columns)
+#'   for the evaluation set. Rows correspond to entries in Y_evaluate.
+#' @param A_evaluate Binary vector of treatment assignments (0/1) in the evaluation set.
+#' @param markers Character vector of column names in X_evaluate to include.
+#' @param power_desired Numeric in (0,1). Desired power for surrogate test.
+#'   Either power_desired or epsilon must be provided.
+#' @param epsilon Numeric in (0,1). Non-inferiority margin. Either epsilon or
+#'   power_desired must be provided.
+#' @param individual Logical. If TRUE, evaluates each marker individually.
+#'   Default: TRUE.
+#' @param weights Data.frame or matrix with columns `marker` and `weight`.
+#'   Inverse weights from the screening stage. If provided, used to weight
+#'   and combine markers.
+#' @param plot Logical. If TRUE, returns a ggplot2 scatter of response vs.
+#'   combined surrogate ranks. Default: TRUE.
+#' @param alpha Numeric significance level. Default: 0.05.
+#' @param mode Character. "independent" (default) or "paired" study design.
+#' @param test Character. "non.inferiority" (default) or "two.one.sided".
+#'
+#' @return A list with:
+#'   \item{X_evaluate_standardised}{Standardised (and weighted) surrogate data.}
+#'   \item{gamma}{Combined surrogate scores for each sample.}
+#'   \item{evaluation_results}{Data.frame with surrogate test results for combined gamma.}
+#'   \item{individual_evaluation}{If individual=TRUE, results per marker.}
+#'   \item{plot}{ggplot2 object of rank scatter (if plot=TRUE).}
+#'
+#' @import dplyr pbmcapply SurrogateRank ggplot2
+#' @author Arthur Hughes
+rise_evaluate <- function(
+    Y_evaluate,
+    X_evaluate,
+    A_evaluate,
+    markers,
+    power_desired = NULL,
+    epsilon = NULL,
+    individual = TRUE,
+    weights = NULL,
+    plot = TRUE,
+    alpha = 0.05,
+    mode = "independent",
+    test = "non.inferiority"
+) {
+  # -- Input validation ------------------------------------------------------
+  n_samples <- length(Y_evaluate)
+  if (nrow(X_evaluate) != n_samples) {
+    stop("nrow(X_evaluate) must equal length(Y_evaluate)")
+  }
+  if (length(A_evaluate) != n_samples) {
+    stop("Length of A_evaluate must match length(Y_evaluate)")
+  }
+  if (is.null(power_desired) && is.null(epsilon)) {
+    stop("Must specify either power_desired or epsilon")
+  }
+  
+  # -- Subset to selected markers --------------------------------------------
+  X_sub <- as.data.frame(X_evaluate)[, markers, drop = FALSE]
+  
+  # -- Individual marker evaluation -----------------------------------------
+  individual_evaluation <- NULL
+  if (individual) {
+    # Prepare data
+    A_fac <- factor(A_evaluate)
+    evaluate_marker <- function(marker_name) {
+      # Split by treatment
+      y1 <- Y_evaluate[A_fac == "1"]
+      y0 <- Y_evaluate[A_fac == "0"]
+      s1 <- X_sub[A_fac == "1", marker_name]
+      s0 <- X_sub[A_fac == "0", marker_name]
+      # Run surrogate test
+      args <- list(
+        yone = y1, yzero = y0,
+        sone = s1, szero = s0,
+        mode = mode, test = test
+      )
+      if (is.null(epsilon)) {
+        args$power.want.s <- power_desired
+      } else {
+        args$epsilon <- epsilon
+      }
+      test_res <- do.call(test.surrogate, args)
+      # Return named vector
+      c(
+        delta       = test_res$delta.estimate,
+        ci_lower    = test_res$ci[1],
+        ci_upper    = test_res$ci[2],
+        sd          = test_res$sd.delta,
+        epsilon     = test_res$epsilon.used,
+        p_unadjusted = test_res$p.delta
+      )
+    }
+    # Parallel apply
+    res_list <- pbmclapply(markers, evaluate_marker, mc.cores = 1)
+    individual_evaluation <- bind_rows(lapply(seq_along(res_list), function(i) {
+      as.data.frame(as.list(res_list[[i]])) %>%
+        mutate(marker = markers[i])
+    })) %>%
+      select(marker, epsilon, delta, sd, ci_lower, ci_upper, p_unadjusted)
+  }
+  
+  # -- Standardize X and apply weights ---------------------------------------
+  X_std <- scale(X_sub)
+  if (!is.null(weights)) {
+    # Replace zero weights with smallest non-zero
+    zero_idx <- weights$weight == 0
+    if (any(zero_idx)) {
+      weights$weight[zero_idx] <- min(abs(weights$weight[!zero_idx]))
+    }
+    w_vec <- setNames(weights$weight, weights$marker)
+    # Divide columns by weight
+    X_std <- sweep(
+      X_std, 2, w_vec[colnames(X_std)], FUN = "/"
+    )
+  }
+  # Combined surrogate score
+  gamma <- rowSums(X_std)
+  
+  # -- Combined surrogate evaluation -----------------------------------------
+  A_fac <- factor(A_evaluate)
+  y1 <- Y_evaluate[A_fac == "1"]
+  y0 <- Y_evaluate[A_fac == "0"]
+  s1 <- gamma[A_fac == "1"]
+  s0 <- gamma[A_fac == "0"]
+  args <- list(
+    yone = y1, yzero = y0,
+    sone = s1, szero = s0,
+    mode = mode, test = test
+  )
+  if (is.null(epsilon)) {
+    args$power.want.s <- power_desired
+  } else {
+    args$epsilon <- epsilon
+  }
+  combined_res <- do.call(test.surrogate, args)
+  evaluation_results <- tibble::tibble(
+    marker        = "gamma_S",
+    delta         = combined_res$delta.estimate,
+    ci_lower      = combined_res$ci[1],
+    ci_upper      = combined_res$ci[2],
+    sd            = combined_res$sd.delta,
+    epsilon       = combined_res$epsilon.used,
+    p_unadjusted  = combined_res$p.delta
+  ) %>%
+    select(marker, epsilon, delta, sd, ci_lower, ci_upper, p_unadjusted)
+  
+  # -- Optional plot ---------------------------------------------------------
+  rank_plot <- NULL
+  if (plot) {
+    rank_df <- tibble::tibble(
+      treatment     = A_fac,
+      response_rank = rank(Y_evaluate),
+      gamma_rank    = rank(gamma)
+    )
+    rho_val <- round(cor(rank_df$response_rank, rank_df$gamma_rank), 2)
+    rank_plot = rank_df %>%
+      ggplot(aes(x = response_rank, y = gamma_rank, col = as.factor(treatment))) + 
+      geom_point(size = 5) +
+      xlab("Primary Response (rank)") +
+      ylab(expression(gamma[S]~"(rank)")) +
+      ggtitle("Ranks of primary response vs new surrogate in evaluation data") +
+      guides(col = guide_legend(title = "Treatment")) +
+      scale_color_manual(
+        labels = levels(as.factor(A_evaluate)),
+        values = c("#1D8A99", "#c1121f")
+      ) +
+      theme_minimal() +
+      geom_abline(slope = 1, col = "red", linetype = "dashed", size = 1.4) +
+      coord_fixed(ratio = 1) +
+      annotate(
+        "text",
+        x = Inf, y = Inf,
+        label = bquote(rho == .(round(cor(as.numeric(rank_df$response_rank), as.numeric(rank_df$gamma_rank)), 2))),
+        vjust = 2, hjust = 3.3,
+        color = "red",
+        size = 15
+      ) +
+      theme_minimal(base_size = 22) +
+      theme(
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.background = element_rect(fill = 'white', color = 'white')
+      )
+  }
+  
+  # -- Return result ---------------------------------------------------------
+  list(
+    X_evaluate_standardised = X_std,
+    gamma                   = gamma,
+    evaluation_results      = evaluation_results,
+    individual_evaluation   = individual_evaluation,
+    plot                    = rank_plot
+  )
+}
+```
+
+
+# Screening Stage
+Apply the statistical test one-by-one to each gene in the data to identify a group of strong candidate surrogates. 
+```{r}
+# Surrogate candidates
+X_mat <- train_df %>%
+  # remove non-marker columns
+  select(-participant_id, -response, -treatment) %>%
+  as.matrix()
+
+# Responses
+Y_vec <- train_df$response %>% 
+  # primary outcome
+  as.matrix()
+
+# "Treatment"
+A_vec <- train_df$treatment %>% 
+  # binary treatment indicator
+  as.matrix()
+
+# Check the treatment effect on the response beforehand
+uy_check <- test.surrogate(
+  yone  = Y_vec[A_vec == 1],
+  yzero = Y_vec[A_vec == 0],
+  sone  = Y_vec[A_vec == 1],
+  szero = Y_vec[A_vec == 0],
+  mode  = "paired",
+  test  = "non.inferiority"
+)$u.y
+
+# print the check statistic
+print(uy_check)
+
+res_screen <- rise_screen(
+  Y             = Y_vec,
+  X             = X_mat,
+  A             = A_vec,
+  reference     = "0",           # control level in A
+  alpha         = 0.05,          # significance threshold
+  power_desired = 0.9,           # desired power for individual tests
+  p_correction  = "bonferroni",  # multiple testing correction
+  cores         = 9,             # parallel cores
+  mode          = "paired",      # study design
+  test          = "two.one.sided" # two one-sided test
+)
+
+res_df <- res_screen$results
+
+# Output how many significant candidate markers
+paste0("There are ", res_screen[["significant_markers"]] %>% length(), " significant markers in the training data.")
+```
+
+## Table 1
+This chunk produces table 1 in the article, which gives the top 20 genes from the screening stage by p-value. 
+```{r, eval = F}
+latex_results <- res_screen$results %>%
+  # order by smallest raw p-value, then keep only significant markers
+  arrange(p_unadjusted) %>%
+  filter(p_adjusted < 0.05) %>%
+  # format columns for LaTeX output:
+  mutate(
+    marker = toupper(marker),  # uppercase marker names
+    # combine delta estimate and confidence interval
+    delta = paste0(
+      round(delta, 3),
+      " (", round(ci_lower, 3), ", ", round(ci_upper, 3), ")"
+    ),
+    sd = round(sd, 3),         # round standard deviation
+    p_unadjusted = formatC(p_unadjusted, format = "e", digits = 1),
+    p_adjusted   = formatC(p_adjusted,   format = "e", digits = 1)
+  ) %>%
+  # select only the columns needed for the table
+  select(marker, delta, sd, p_unadjusted, p_adjusted)
+
+#  Print top 20 rows as a LaTeX table (no row names)
+print(
+  myxtable(head(latex_results, 20)),
+  include.rownames = FALSE
+)
+```
+
+## Table 2
+This chunk gives the results shown in table 2 of the article, giving functional annotation of 235 significant genes using DAVID bioinformatics software. The table shows functional terms, the number of associated genes, and adjusted p-values for a test of term overrepresentation compared to a random sample of the same size fromthe 10,086 aligned genes.
+```{r, eval = F}
+# Uppercase, comma‐separated lists for paste‐into‐DAVID
+david_genes      <- toupper(res_screen$significant_markers)
+david_string     <- paste(david_genes, collapse = ", ")
+
+background_genes <- toupper(gene_names)
+background_string<- paste(background_genes, collapse = ", ")
+
+# Print to console for copy‐paste
+cat("DAVID gene list:\n",      david_string,      "\n\n")
+cat("DAVID background list:\n", background_string, "\n")
+
+
+# Load DAVID output and format for LaTeX
+david_df <- read.table(
+  file   = "./output/application/david.txt",
+  header = TRUE,
+  sep    = "\t",
+  stringsAsFactors = FALSE
+)
+
+formatted_david <- david_df %>%
+  select(Term, Count, Benjamini) %>%
+  mutate(
+    # scientific notation for adjusted p-values
+    Benjamini = formatC(Benjamini, format = "e", digits = 1),
+    # replace tildes with hyphens in term names
+    Term       = gsub("~", "-", Term)
+  )
+
+# Print top 10 enriched terms as a LaTeX table (no row names)
+print(
+  myxtable(head(formatted_david, 10)),
+  include.rownames = FALSE
+)
+```
+
+
+# Evaluation Stage
+
+## Figure 5
+
+This chunk generates Figure 5 in the article, which shows the ranks of the mean neutralising antibodies against the ranks of the constructed 235-gene-combination surrogate marker in the evaluation dataset. The Spearman rank correlation coefficient is 0.79, indicating strong positive correlation.
+```{r}
+# Select significant markers from screening
+selected_genes <- res_screen$significant_markers
+
+# Prepare evaluation data matrices
+X_eval <- test_df %>%
+  select(all_of(selected_genes)) %>%
+  as.matrix()     # surrogate candidates
+
+Y_eval <- test_df$response %>%
+  as.matrix()     # primary response
+
+A_eval <- test_df$treatment %>%
+  as.matrix()     # treatment indicator
+
+# Sanity check: surrogate test on response itself (paired, two one-sided)
+uy_check <- test.surrogate(
+  yone  = Y_eval[A_eval == 1],
+  yzero = Y_eval[A_eval == 0],
+  sone  = Y_eval[A_eval == 1],
+  szero = Y_eval[A_eval == 0],
+  mode  = "paired",
+  test  = "two.one.sided"
+)$u.y
+
+print(uy_check)  # should be > 0 if test setup is valid
+
+# Prepare weights: absolute values from screening results
+weights_df <- res_screen$weights
+weights_df$weight <- abs(weights_df$weight)
+
+# Run RISE evaluation on combined surrogate γ
+evaluate_results <- rise_evaluate(
+  Y_evaluate    = Y_eval,
+  X_evaluate    = X_eval,
+  A_evaluate    = A_eval,
+  markers       = selected_genes,
+  individual    = TRUE,
+  power_desired = 0.9,
+  plot          = TRUE,
+  weights       = weights_df,
+  mode          = "paired",
+  test          = "two.one.sided"
+)
+
+# Refine and display the rank‐scatter plot
+fig5 <- evaluate_results$plot +
+  geom_point(size = 8) +
+  labs(
+    x     = "Neutralising Antibodies (rank)",
+    y     = expression(gamma[S]~"(rank)"),
+    color = "Sample"
+  ) +
+  scale_color_manual(
+    labels = c("Pre-vaccine", "Post-vaccine"),
+    values = c("#7BC4F4", "#001B52")
+  ) +
+  guides(
+    color = guide_legend(
+      override.aes = list(size = 10)  # larger legend points
+    )
+  ) +
+  theme_minimal(base_size = 35) +
+  theme(
+    plot.title       = element_blank(),
+    axis.title.x     = element_text(size = 35),
+    axis.title.y     = element_text(size = 45),
+    legend.text      = element_text(size = 25),
+    legend.title     = element_text(size = 35),
+    plot.background  = element_rect(fill = "white", color = "white")
+  )
+
+print(fig5)
+
+# Optional: save figure
+ggsave(
+  filename = "figure5.eps",
+  plot     = fig5,
+  path     = here("output", "figures"),
+  units    = "cm",
+  width    = 35,
+  height   = 25,
+  dpi      = 800
+)
+ggsave(
+  filename = "figure5.pdf",
+  plot     = fig5,
+  path     = here("output", "figures"),
+  units    = "cm",
+  width    = 35,
+  height   = 25,
+  dpi      = 800
+)
+
+# Display evaluation summary for combined surrogate
+evaluate_results$evaluation_results
+```
+
+# Supplementary Figures
+## Supplementary Table S1
+
+This chunk produces Supplementary Table S1, which shows all genes with a p-value less than 0.05 from the screening stage. 
+```{r}
+# Format significant screening results for inclusion in a LaTeX table
+latex_results <- res_screen$results %>%
+  # order by raw p-value and keep only those passing the adjusted threshold
+  arrange(p_unadjusted) %>%
+  filter(p_adjusted < 0.05) %>%
+  # prepare human-readable columns
+  mutate(
+    marker       = toupper(marker),
+    # combine estimate and CI
+    delta        = paste0(
+                     round(delta,     3),
+                     " (",
+                     round(ci_lower,  3), ", ",
+                     round(ci_upper,  3),
+                     ")"
+                   ),
+    sd           = round(sd,           3),
+    p_unadjusted = formatC(p_unadjusted, format = "e", digits = 1),
+    p_adjusted   = formatC(p_adjusted,   format = "e", digits = 1)
+  ) %>%
+  # select and order the final columns
+  select(marker, delta, sd, p_unadjusted, p_adjusted)
+
+# Render the top rows as a LaTeX table (no row names)
+print(
+  myxtable(latex_results),
+  include.rownames = FALSE
+)
+```
+
+
+## Supplementary Table S2
+
+This chunk produces Supplementary Table S2, which is a sensitivity analysis evaluating the effect of varying the non-inferiority margin $\epsilon$, where values closer to 0 result in fewer candidate surrogates to combine for the evaluation stage. The evaluation metric for the combined marker, $\boldsymbol{\delta_{\gamma_{S}}}$, its standard deviation, and its p-value corresponding to a test based on a desired power of 90\% are given in the table.
+```{r}
+# Prepare training matrices
+X_train <- train_df %>%
+  select(-participant_id, -response, -treatment) %>%
+  as.matrix()
+Y_train <- train_df$response %>% as.matrix()
+A_train <- train_df$treatment %>% as.matrix()
+
+# Define the grid of non‐inferiority margins
+epsilon_grid <- c(0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35)
+
+# 1. Run RISE screening over the epsilon grid -------------------------------
+res_screen_sensitivity <- lapply(epsilon_grid, function(eps) {
+  rise_screen(
+    Y           = Y_train,
+    X           = X_train,
+    A           = A_train,
+    reference   = "0",
+    alpha       = 0.05,
+    epsilon     = eps,
+    p_correction= "bonferroni",
+    cores       = 9,
+    mode        = "paired",
+    test        = "two.one.sided"
+  )
+})
+
+# 2. Extract significant marker lists and counts -----------------------------
+significant_lists    <- lapply(res_screen_sensitivity, "[[", "significant_markers")
+n_significant        <- vapply(significant_lists, length, integer(1))
+
+# 3. Prepare evaluation set matrices (test participants) ---------------------
+Y_test  <- test_df$response  %>% as.matrix()
+A_test  <- test_df$treatment %>% as.matrix()
+
+# 4. Evaluate combined surrogate for each epsilon where markers exist --------
+evaluate_results_sensitivity <- list()
+
+for (i in seq_along(epsilon_grid)) {
+  markers_i <- significant_lists[[i]]
+  if (length(markers_i) == 0) next
+  
+  # build surrogate matrix and absolute weights
+  X_test_i <- test_df %>% select(all_of(markers_i)) %>% as.matrix()
+  weights_i <- res_screen_sensitivity[[i]]$weights
+  weights_i$weight <- abs(weights_i$weight)
+  
+  # run evaluation
+  evaluate_results_sensitivity[[i]] <- rise_evaluate(
+    Y_evaluate    = Y_test,
+    X_evaluate    = X_test_i,
+    A_evaluate    = A_test,
+    markers       = markers_i,
+    individual    = TRUE,
+    power_desired = 0.9,
+    plot          = TRUE,
+    weights       = weights_i,
+    mode          = "paired",
+    test          = "two.one.sided"
+  )
+}
+
+# 5. Assemble sensitivity table ---------------------------------------------
+# Identify the epsilons with non-empty evaluations
+valid_idx <- which(!vapply(evaluate_results_sensitivity, is.null, logical(1)))
+
+# Bind each evaluation_results with its epsilon and predictor count
+sensitivity_df <- bind_rows(
+  lapply(valid_idx, function(i) {
+    evaluate_results_sensitivity[[i]]$evaluation_results %>%
+      mutate(
+        epsilon_screen = epsilon_grid[i],
+        n_predictors   = n_significant[i]
+      )
+  })
+)
+
+# Format for LaTeX
+latex_input <- sensitivity_df %>%
+  mutate(
+    delta_ci      = paste0(
+                      round(delta, 3),
+                      " (", round(ci_lower, 3), ", ", round(ci_upper, 3), ")"
+                    ),
+    sd_round      = round(sd, 3),
+    p_unadjusted  = formatC(p_unadjusted, format = "e", digits = 1)
+  ) %>%
+  select(epsilon_screen, n_predictors, delta_ci, sd_round, p_unadjusted)
+
+# 6. Print LaTeX table (no row names) ----------------------------------------
+# helper to force character matrix into xtable
+myxtable <- function(df, ...) {
+  xtable::xtable(apply(df, 2, as.character), ...)
+}
+
+print(
+  myxtable(latex_input),
+  include.rownames = FALSE
+)
+```
+
+
+## Supplementary Table S3
+
+This chunk produces supplementary table S3, which compares the evaluation results between the composite surrogate marker \(\gamma_{\mathcal{S}}\), constructed from the 222 significant genes identified in the screening stage, and the top 10 genes from the screening stage evaluated individually in the evaluation data.
+```{r}
+# Select significant markers from the screening stage
+selected_markers <- res_screen$significant_markers
+
+# Prepare matrices for evaluation
+X_eval <- test_df %>%
+  select(all_of(selected_markers)) %>%
+  as.matrix()      # surrogate candidates
+
+Y_eval <- test_df$response %>%
+  as.matrix()      # primary response
+
+A_eval <- test_df$treatment %>%
+  as.matrix()      # treatment indicator
+
+# Prepare absolute weights from screening
+weights_df <- res_screen$weights
+weights_df$weight <- abs(weights_df$weight)
+
+# 1) Evaluate the combined surrogate (all selected markers)
+combined_eval <- rise_evaluate(
+  Y_evaluate    = Y_eval,
+  X_evaluate    = X_eval,
+  A_evaluate    = A_eval,
+  markers       = selected_markers,
+  individual    = TRUE,
+  power_desired = 0.9,
+  plot          = TRUE,
+  weights       = weights_df,
+  mode          = "paired",
+  test          = "two.one.sided"
+)
+
+# Start results with the combined surrogate
+eval_res <- combined_eval$evaluation_results
+
+# 2) Evaluate each marker individually in order of raw p-value from screening
+ordered_markers <- res_df %>%
+  arrange(p_unadjusted) %>%
+  head(10) %>% 
+  pull(marker)
+
+for (marker_name in ordered_markers) {
+  # single-marker matrix
+  X_single <- test_df %>%
+    select(all_of(marker_name)) %>%
+    as.matrix()
+
+  # evaluate just that marker
+  single_eval <- rise_evaluate(
+    Y_evaluate    = Y_eval,
+    X_evaluate    = X_single,
+    A_evaluate    = A_eval,
+    markers       = marker_name,
+    individual    = TRUE,
+    power_desired = 0.9,
+    plot          = FALSE,  # skip plotting each time
+    weights       = weights_df,
+    mode          = "paired",
+    test          = "two.one.sided"
+  )
+
+  # extract and tag the result row
+  row <- single_eval$evaluation_results
+  row$marker <- marker_name
+
+  # append to results
+  eval_res <- bind_rows(eval_res, row)
+}
+
+# 3) Format top 10 results for LaTeX
+latex_results <- eval_res %>%
+  mutate(
+    marker        = toupper(marker),
+    delta         = paste0(
+      round(delta, 3),
+      " (", round(ci_lower, 3), ", ", round(ci_upper, 3), ")"
+    ),
+    sd            = round(sd, 3),
+    p_unadjusted  = formatC(p_unadjusted, format = "e", digits = 1)
+  ) %>%
+  select(marker, delta, sd, p_unadjusted) %>%
+  head(11)
+
+# Print as a LaTeX table (no row names)
+print(
+  myxtable(latex_results),
+  include.rownames = FALSE
+)
+
+```
+
+## Supplementary Figure S8
+
+This chunk generates Supplementary Figure 8: A visual method to select markers to pass the screening stage. The x-axis is the negative log of the $\delta$ values, where $0.05$ is added to avoid taking the log of 0, and the y-axis is the negative log of the raw p-value. Markers with a stronger surrogate strength appear towards the top-right of the plot. One could select markers without relying on a p-value threshold by choosing those which are most separated from the rest. In this example, the top 16 genes are labelled as they visually separate themselves. Evaluating the combined surrogacy of these genes gives $\delta 95\%\text{C.I.} = -0.01 (-1,0.009)$ corresponding to $p = 2.1e-40$. Points in red are the 235 genes which were selected according to the adjusted p-value threshold of 0.05. 
+```{r}
+# Prepare filtered results for plotting
+res_filtered <- res_df %>%
+  # keep only reasonable delta values
+  filter(delta < 1) %>%
+  # uppercase gene names
+  mutate(marker      = toupper(marker),
+         # avoid -Inf when p_adjusted == 0
+         p_adjusted = replace(p_adjusted, p_adjusted == 0, 1e-300),
+         # flag significance
+         significant = p_adjusted < 0.05,
+         p_group     = if_else(significant, "<0.05", ">0.05"))
+
+# Identify top 17 most significant genes (finite values only)
+top_genes <- res_filtered %>%
+  filter(is.finite(delta), is.finite(p_adjusted)) %>%
+  arrange(p_adjusted) %>%
+  slice_head(n = 17)
+
+# Create volcano-like plot of delta vs –log10(p_adjusted)
+figs8 <- ggplot(res_filtered, aes(x = delta, y = -log10(p_adjusted), color = p_group)) +
+  geom_point(size = 2, alpha = 0.2) +
+  # label top genes with red text and arrows
+  geom_text_repel(
+    data         = top_genes,
+    aes(label    = marker),
+    color        = "red",
+    size         = 9,
+    arrow        = arrow(type = "closed", length = unit(0, "inches")),
+    box.padding  = 0.5,
+    nudge_x      = 0.3,
+    nudge_y      = 0.5,
+    max.overlaps = 10,
+    segment.color= "red",
+    segment.alpha= 0.2
+  ) +
+  scale_color_manual(
+    values = c("<0.05" = "red", ">0.05" = "black"),
+    labels = c("<0.05", ">0.05")
+  ) +
+  labs(
+    x     = expression(delta),
+    y     = expression(-log[10](p[adj])),
+    color = expression(p[adj])
+  ) +
+  coord_cartesian(xlim = c(-0.1, 1)) +
+  theme_minimal(base_size = 30) +
+  theme(
+    legend.title      = element_text(size = 30),
+    legend.text       = element_text(size = 25),
+    plot.background   = element_rect(fill = "white", color = NA)
+  )
+
+# Save figure to PDF
+ggsave(
+  filename = "figureS8.pdf",
+  plot     = figs8,
+  path     = here("output", "figures"),
+  units    = "cm",
+  width    = 40,
+  height   = 25
+)
+
+```
+
+# Session info
+
+```{r}
+sink("session_info.txt")
+sessionInfo()
+sink()
+```
